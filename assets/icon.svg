@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>SailHighSea SimpleSync</title>
+  <defs>
+    <linearGradient id="gear" gradientUnits="userSpaceOnUse" x1="20" y1="4" x2="108" y2="124">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#gear)">
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(0 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(45 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(90 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(135 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(180 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(225 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(270 64 64)"/>
+    <rect x="54" y="4" width="20" height="16" rx="4.5" transform="rotate(315 64 64)"/>
+  </g>
+  <circle cx="64" cy="64" r="41.25" fill="none" stroke="url(#gear)" stroke-width="16.5"/>
+  <circle cx="64" cy="64" r="33" fill="#0F172A"/>
+  <g transform="translate(64 61.05)">
+    <polygon points="-1.6,-18.6 -1.6,0.6 -12,0.6" fill="#FFFFFF"/>
+    <polygon points="1.6,-17 1.6,0.6 12,0.6" fill="#93C5FD"/>
+    <polygon points="-13.6,3 13.6,3 10,7.8 -10,7.8" fill="#FFFFFF"/>
+    <polyline points="14.55,16.21 14.01,16.84 13.44,17.44 12.84,18.01 12.21,18.55 11.57,19.07 10.9,19.56 10.21,20.02 9.5,20.45 8.77,20.85 8.03,21.22 7.27,21.55 6.5,21.85 5.71,22.12 4.92,22.35 4.11,22.55 3.3,22.71 2.48,22.84 1.66,22.93 0.83,22.98 0,23 -0.83,22.98 -1.66,22.93 -2.48,22.84 -3.3,22.71 -4.11,22.55 -4.92,22.35 -5.71,22.12 -6.5,21.85 -7.27,21.55 -8.03,21.22 -8.77,20.85 -9.5,20.45 -10.21,20.02 -10.9,19.56 -11.57,19.07 -12.21,18.55 -12.84,18.01 -13.44,17.44 -14.01,16.84 -14.55,16.21" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <polygon points="-19.38,10.47 -17.77,18.91 -11.34,13.51" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="round"/>
+    <polygon points="19.38,10.47 17.77,18.91 11.34,13.51" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="round"/>
+  </g>
+</svg>

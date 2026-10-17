@@ -1,0 +1,38 @@
+﻿# Build output
+/build/
+/build-*/
+/out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Local dev test folder: compiled exe, sandbox copies, task list (keep the folder itself)
+/test/*
+!/test/.gitkeep
+
+# Compiled objects / debug info
+*.o
+*.obj
+*.pdb
+*.ilk
+*.log
+*.tmp
+
+# Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+.vs/
+
+# Signing keys and secrets
+*.pfx
+*.pem
+*.key
+secrets.json
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
