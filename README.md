@@ -49,14 +49,26 @@ It is written in C with [raylib](https://www.raylib.com/), so the whole program 
 **Speed**
 - Several files are copied in parallel, and small files are read ahead in order to cut drive seeks on hard disks
 - Large files are read ahead while the previous block is written, so a copy runs at the speed of the slower drive
+- New small files are written straight to their final name, and the source and target folders are scanned at the same time with several threads (30,000 files of 1-8 KB copy about twice as fast)
 - USB sticks and other removable drives automatically use one writer and write files directly
 - Copy threads and read-ahead buffer are adjustable in Settings
 
 **App**
-- Light, dark or system theme with the system font and a rounded, modern window
+- Icon rail navigation and page tabs (Tasks, Quick copies, Schedule, Archive)
+- Nine themes: system, light, dark and the retro [Flat 98, Win98, Mac System 7, Mac Platinum, Linux CDE and Linux GNOME 2](#themes)
 - Windows: system tray icon, start with Windows, start hidden, close to tray
 - Only one copy runs; starting it again brings the running window forward
 - A debug log (`simplesync-debug.log`) next to the program records scans, conflicts and OS error codes
+
+## Themes
+
+Pick a theme in **Settings > Appearance**. System, Light and Dark are the modern rounded look. The retro themes are below, from left to right and top to bottom: Win98, Flat 98, Mac System 7, Mac Platinum, Linux CDE and Linux GNOME 2.
+
+<p align="center">
+  <img src="assets/themes.png" alt="The retro themes: Win98, Flat 98, Mac System 7, Mac Platinum, Linux CDE and Linux GNOME 2" width="900">
+</p>
+
+Flat 98, Win98, Mac System 7 and Linux CDE have square corners and no anti-aliasing, so they use noticeably less memory (about 160-180 MB instead of about 380 MB in one test on Windows). Switching to or from one of them restarts the app.
 
 ## Download
 

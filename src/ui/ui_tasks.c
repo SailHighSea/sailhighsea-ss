@@ -11,7 +11,7 @@
 #define CARD_RADIUS_PX 16.0f
 #define CARD_H_SMALL  92.0f    /* idle / paused: header, then paths + progress on one row */
 #define CARD_H_SYNC  118.0f    /* syncing: plus the speed / remaining / file line */
-#define CARD_H_ERROR 130.0f    /* error: plus the error box */
+#define CARD_H_ERROR 140.0f    /* error: plus the error box */
 #define CARD_H_QUICK 142.0f    /* Quick Copy panel: two progress rows and a button row */
 #define SCROLLBAR_W  6
 #define WHEEL_STEP   60.0f
@@ -90,8 +90,8 @@ static float DrawBadge(ShsTaskState state, float rightX, float y)      /* return
     const int fs = 12, iconW = 13, padX = 8;
     float w = (float)(padX * 2 + iconW + ShsMeasureText(label, fs));
     Rectangle r = { rightX - w, y, w, 18 };                /* slim pill */
-    DrawRectangleRounded(r, 1.0f, 12, Fade(col, 0.16f));
-    DrawRectangleRoundedLinesEx(r, 1.0f, 12, 1.0f, Fade(col, 0.55f));
+    ShsRoundRec(r, 1.0f, 12, Fade(col, 0.16f));
+    ShsRoundLines(r, 1.0f, 12, 1.0f, Fade(col, 0.55f));
 
     float cx = r.x + padX + 3.5f, cy = r.y + r.height / 2;
     if (state == SHS_TASK_SYNCING) {
@@ -195,10 +195,11 @@ static void DrawStatsRow(const ShsTask *t, float x, float rowY, float maxRight)
     float barX = px + PCT_W;
     float barW = fminf(260.0f, maxRight - barX);
     if (barW < 40.0f) return;
+    if (ShsDrawProgress((Rectangle){ barX, rowY + 3, barW, 14 }, p, StateColor(t->state))) return;     /* retro themes */
     Rectangle track = { barX, rowY + 6, barW, 8 };
-    DrawRectangleRounded(track, 1.0f, 8, SHS_COLOR_BG);
+    ShsRoundRec(track, 1.0f, 8, SHS_COLOR_BG);
     if (p > 0.0f)
-        DrawRectangleRounded((Rectangle){ barX, track.y, fmaxf(track.height, barW * p), track.height }, 1.0f, 8, StateColor(t->state));
+        ShsRoundRec((Rectangle){ barX, track.y, fmaxf(track.height, barW * p), track.height }, 1.0f, 8, StateColor(t->state));
 }
 
 /* Line under the stats row while syncing: the file being copied. */
@@ -220,7 +221,7 @@ static bool IconButton(const ShsTaskView *v, const CardButton *b, const CardButt
     if (b->armed)        { bg = SHS_COLOR_DANGER;  ink = SHS_COLOR_ON_PRIMARY; }
     else if (b->primary) { bg = hot ? SHS_COLOR_PRIMARY_HOVER : SHS_COLOR_PRIMARY; ink = SHS_COLOR_ON_PRIMARY; }
     else                 { bg = hot ? SHS_COLOR_CARD_HOVER : SHS_COLOR_BG; ink = hot ? SHS_COLOR_TEXT_MAIN : SHS_COLOR_TEXT_MUTED; }
-    ShsDrawRoundedBox(b->r, 7.0f, bg, (b->primary || b->armed) ? bg : SHS_COLOR_BORDER);
+    ShsDrawButtonBox(b->r, 7.0f, bg, (b->primary || b->armed) ? bg : SHS_COLOR_BORDER, hot && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
     ShsDrawIcon(b->icon, b->r.x + b->r.width / 2, b->r.y + b->r.height / 2, 14.0f, ink);
     if (hot) *hoverOut = b;
     return hot && Pressed(v);
@@ -232,7 +233,7 @@ static void DrawTooltip(const char *tip, Rectangle target, bool below, float lim
     Rectangle t = { target.x + target.width / 2 - (tw + 20) / 2.0f, below ? target.y + target.height + 6 : target.y - 30, (float)(tw + 20), 24 };
     if (t.x + t.width > limitRight) t.x = limitRight - t.width;
     if (t.x < target.x - 4 && below) t.x = target.x - 4;
-    DrawRectangleRounded(t, 0.4f, 8, SHS_COLOR_TEXT_MAIN);
+    ShsRoundRec(t, 0.4f, 8, SHS_COLOR_TEXT_MAIN);
     ShsDrawText(tip, (int)t.x + 10, (int)t.y + 4, 13, SHS_COLOR_BG);
 }
 
@@ -315,8 +316,8 @@ static void DrawFilePanel(const ShsTask *t, Rectangle r, float baseH, float x, f
             float p = f->size ? (float)((double)f->done / (double)f->size) : 0.0f;
             float bx = x + w - sizeW - 16 - 170.0f;
             Rectangle track = { bx, cy - 4, 120, 8 };
-            DrawRectangleRounded(track, 1.0f, 8, SHS_COLOR_BG);
-            if (p > 0.0f) DrawRectangleRounded((Rectangle){ bx, cy - 4, fmaxf(8.0f, 120.0f * Clampf(p, 0, 1)), 8 }, 1.0f, 8, SHS_COLOR_PRIMARY);
+            ShsRoundRec(track, 1.0f, 8, SHS_COLOR_BG);
+            if (p > 0.0f) ShsRoundRec((Rectangle){ bx, cy - 4, fmaxf(8.0f, 120.0f * Clampf(p, 0, 1)), 8 }, 1.0f, 8, SHS_COLOR_PRIMARY);
             char pct[12];
             snprintf(pct, sizeof pct, "%d%%", (int)(Clampf(p, 0, 1) * 100.0f + 0.5f));
             ShsDrawText(pct, (int)(bx + 128), (int)cy - 7, 13, SHS_COLOR_TEXT_MAIN);
@@ -346,7 +347,7 @@ static bool TextButton(const ShsTaskView *v, Rectangle r, const char *label, boo
 {
     bool hot = enabled && inside && CheckCollisionPointRec(MousePos(v), r);
     Color bg = !enabled ? Fade(SHS_COLOR_BG, 0.5f) : (primary ? (hot ? SHS_COLOR_PRIMARY_HOVER : SHS_COLOR_PRIMARY) : (hot ? SHS_COLOR_CARD_HOVER : SHS_COLOR_BG));
-    ShsDrawRoundedBox(r, 8.0f, bg, primary && enabled ? bg : SHS_COLOR_BORDER);
+    ShsDrawButtonBox(r, 8.0f, bg, primary && enabled ? bg : SHS_COLOR_BORDER, hot && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
     Color ink = !enabled ? Fade(SHS_COLOR_TEXT_MUTED, 0.5f) : (primary ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN);
     int tw = ShsMeasureText(label, 15);
     ShsDrawText(label, (int)(r.x + (r.width - tw) / 2), (int)(r.y + (r.height - 15) / 2 - 1), 15, ink);
@@ -384,9 +385,9 @@ static void RightText(const char *text, float rightX, float y, int size, Color c
 
 static void ThinBar(float x, float y, float w, float p, Color fill)
 {
-    DrawRectangleRounded((Rectangle){ x, y, w, 4 }, 1.0f, 6, SHS_COLOR_BORDER);
+    ShsRoundRec((Rectangle){ x, y, w, 4 }, 1.0f, 6, SHS_COLOR_BORDER);
     p = Clampf(p, 0.0f, 1.0f);
-    if (p > 0.0f) DrawRectangleRounded((Rectangle){ x, y, fmaxf(4.0f, w * p), 4 }, 1.0f, 6, fill);
+    if (p > 0.0f) ShsRoundRec((Rectangle){ x, y, fmaxf(4.0f, w * p), 4 }, 1.0f, 6, fill);
 }
 
 /* ---- Quick Copy expanded panel: File list | Target | Options | Status | Log ---------------------------------------- */
@@ -485,7 +486,7 @@ static ShsTaskAction DrawQuickPanel(ShsTaskView *v, const ShsTask *t, Rectangle 
 
         Rectangle fb = { x + w - 150, by, 150, 28 };
         bool fhot = inside && CheckCollisionPointRec(MousePos(v), fb);
-        ShsDrawRoundedBox(fb, 8.0f, fhot ? SHS_COLOR_CARD_HOVER : SHS_COLOR_BG, SHS_COLOR_BORDER);
+        ShsDrawButtonBox(fb, 8.0f, fhot ? SHS_COLOR_CARD_HOVER : SHS_COLOR_BG, SHS_COLOR_BORDER, fhot && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
         ShsDrawText(FILTER_LABEL[v->filter[id] & 3], (int)fb.x + 12, (int)fb.y + 6, 14, SHS_COLOR_TEXT_MAIN);
         ShsDrawIcon(SHS_ICON_CHEVRON_DOWN, fb.x + fb.width - 16, fb.y + 14, 12.0f, SHS_COLOR_TEXT_MUTED);
         if (fhot && Pressed(v)) { v->filter[id] = (v->filter[id] + 1) & 3; v->listTop[id] = 0; }
@@ -523,7 +524,7 @@ static ShsTaskAction DrawQuickPanel(ShsTaskView *v, const ShsTask *t, Rectangle 
         for (int k = 0; k < n; k++) {
             float ry = list.y + k * QP_ROW_H, cy = ry + QP_ROW_H / 2;
             const ShsTaskRow *f = &rows[k];
-            if (f->state == 0 || f->state == 5) DrawRectangleRounded((Rectangle){ x, ry + 1, w - (scrollable ? 12.0f : 0.0f), QP_ROW_H - 2 }, 0.3f, 6, Fade(SHS_COLOR_PRIMARY, 0.10f));
+            if (f->state == 0 || f->state == 5) ShsRoundRec((Rectangle){ x, ry + 1, w - (scrollable ? 12.0f : 0.0f), QP_ROW_H - 2 }, 0.3f, 6, Fade(SHS_COLOR_PRIMARY, 0.10f));
             ShsDrawIcon(SHS_ICON_LOGS, x + 14, cy, 13.0f, SHS_COLOR_TEXT_MUTED);
             FormatSize(a, sizeof a, f->size);
             float right = x + w - (scrollable ? 14.0f : 4.0f);
@@ -539,8 +540,8 @@ static ShsTaskAction DrawQuickPanel(ShsTaskView *v, const ShsTask *t, Rectangle 
         if (scrollable) {
             float th = fmaxf(24.0f, list.height * visible / total);
             float tyb = list.y + (list.height - th) * (top / (float)(total - visible));
-            DrawRectangleRounded((Rectangle){ x + w - 6, list.y, 5, list.height }, 1.0f, 6, Fade(SHS_COLOR_BG, 0.8f));
-            DrawRectangleRounded((Rectangle){ x + w - 6, tyb, 5, th }, 1.0f, 6, SHS_COLOR_BORDER);
+            ShsRoundRec((Rectangle){ x + w - 6, list.y, 5, list.height }, 1.0f, 6, Fade(SHS_COLOR_BG, 0.8f));
+            ShsRoundRec((Rectangle){ x + w - 6, tyb, 5, th }, 1.0f, 6, SHS_COLOR_BORDER);
         }
     } else if (v->tab[id] == 1) {
         ShsDrawText("Target folder", (int)x, (int)by + 6, 13, SHS_COLOR_TEXT_MUTED);
@@ -720,7 +721,7 @@ static ShsTaskAction DrawCard(ShsTaskView *view, int index, const ShsTask *t, Re
     if (logoTex.id) DrawTexturePro(logoTex, (Rectangle){ 0, 0, (float)logoTex.width, (float)logoTex.height }, av, (Vector2){ 0, 0 }, 0.0f, WHITE);
     else            ShsDrawRoundedBox(av, 8.0f, Fade(StateColor(t->state), 0.3f), Fade(StateColor(t->state), 0.6f));
     if (avHot) {
-        DrawRectangleRounded(av, 0.3f, 10, Fade(BLACK, 0.6f));
+        ShsRoundRec(av, 0.3f, 10, Fade(BLACK, 0.6f));
         ShsDrawIcon(playIcon, av.x + AVATAR / 2.0f + (playIcon == SHS_ICON_PLAY ? 1.0f : 0.0f), av.y + AVATAR / 2.0f, 16.0f, SHS_COLOR_ON_PRIMARY);
     }
     /* title row: name, meta text, then the status pill; the paths go on the next line */
@@ -797,8 +798,8 @@ static ShsTaskAction DrawCard(ShsTaskView *view, int index, const ShsTask *t, Re
     if (t->state == SHS_TASK_SYNCING) DrawFileLine(t, tx, r.y + 88, r.x + r.width - CARD_PAD - tx);
     if (t->state == SHS_TASK_ERROR) {
         Rectangle box = { x, r.y + 90, w, 32 };
-        DrawRectangleRounded(box, 0.3f, 8, Fade(SHS_COLOR_DANGER, 0.18f));
-        DrawRectangleRoundedLinesEx(box, 0.3f, 8, 1.0f, Fade(SHS_COLOR_DANGER, 0.7f));
+        ShsRoundRec(box, 0.3f, 8, Fade(SHS_COLOR_DANGER, 0.18f));
+        ShsRoundLines(box, 0.3f, 8, 1.0f, Fade(SHS_COLOR_DANGER, 0.7f));
         ShsDrawIcon(SHS_ICON_WARN, box.x + 18, box.y + box.height / 2, 16.0f, SHS_COLOR_DANGER);
         DrawTextFit(t->errorMsg[0] ? t->errorMsg : "Sync failed", box.x + 36, box.y + 8, 15, box.width - 48, SHS_COLOR_TEXT_MAIN, false);
     }
@@ -897,8 +898,8 @@ ShsTaskEvent ShsTaskListDraw(ShsTaskView *view, const ShsTask *tasks, int count,
         float trackX = bounds.x + bounds.width - SCROLLBAR_W;
         float thumbH = fmaxf(32.0f, bounds.height * bounds.height / contentH);
         float thumbY = bounds.y + (bounds.height - thumbH) * (view->scroll / maxScroll);
-        DrawRectangleRounded((Rectangle){ trackX, bounds.y, SCROLLBAR_W, bounds.height }, 1.0f, 6, Fade(SHS_COLOR_CARD, 0.6f));
-        DrawRectangleRounded((Rectangle){ trackX, thumbY, SCROLLBAR_W, thumbH }, 1.0f, 6, SHS_COLOR_BORDER);
+        ShsRoundRec((Rectangle){ trackX, bounds.y, SCROLLBAR_W, bounds.height }, 1.0f, 6, Fade(SHS_COLOR_CARD, 0.6f));
+        ShsRoundRec((Rectangle){ trackX, thumbY, SCROLLBAR_W, thumbH }, 1.0f, 6, SHS_COLOR_BORDER);
     }
     EndScissorMode();
 

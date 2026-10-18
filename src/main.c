@@ -21,7 +21,7 @@
 #endif
 #define TITLEBAR_H      48
 #define STATUSBAR_H     30
-#define SIDEBAR_W       220
+#define SIDEBAR_W       64      /* icon rail */
 #define BTN_W           46
 #define MAX_TASKS       64
 
@@ -104,6 +104,7 @@ static int       g_copyBufMiB = 64;          /* read-ahead buffer for small file
 static bool      g_hidden = false;           /* window currently hidden in the tray */
 static bool      g_launchedHidden = false;   /* started with --minimized */
 static bool      g_multi = false;            /* started with --multi (testing): must not touch the start-up entry */
+static bool      g_restart = false;          /* theme switch: start a fresh copy after closing */
 static float     g_winR = 12.0f;             /* window corner radius; 0 when maximized */
 static Texture2D g_logo;
 static Texture2D g_logoGray;               /* grey copy of the logo, shown on paused tasks */                   /* title bar logo, from the embedded icon */
@@ -238,7 +239,7 @@ static float RoundNess(Rectangle r, float radius)
 static void FillRound(Rectangle r, float radius, Color c)
 {
     if (radius < 0.5f) DrawRectangleRec(r, c);
-    else               DrawRectangleRounded(r, RoundNess(r, radius), 16, c);
+    else               ShsRoundRec(r, RoundNess(r, radius), 16, c);
 }
 
 /* Rounded on top only (title bar) / bottom only (status bar). */
@@ -261,7 +262,7 @@ static bool ButtonI(Rectangle r, const char *label, ShsIcon icon, bool primary, 
     bool hot = CheckCollisionPointRec(Mouse(), r);
     Color bg = primary ? (hot ? SHS_COLOR_PRIMARY_HOVER : SHS_COLOR_PRIMARY)
                        : (active ? SHS_COLOR_PRIMARY : (hot ? SHS_COLOR_CARD_HOVER : SHS_COLOR_CARD));
-    ShsDrawRoundedBox(r, 9.0f, bg, (primary || active) ? bg : SHS_COLOR_BORDER);
+    ShsDrawButtonBox(r, 9.0f, bg, (primary || active) ? bg : SHS_COLOR_BORDER, active || (hot && !g_block && IsMouseButtonDown(MOUSE_BUTTON_LEFT)));
     Color ink = (primary || active) ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN;
 
     int tw = ShsMeasureText(label, 15);
@@ -302,19 +303,20 @@ static void HandleTyping(char *buf, size_t cap)
 
 static void DrawFieldEx(Rectangle r, const char *text, const char *placeholder, bool focused, ShsIcon icon, bool onTitle)
 {
-    const Color ink    = onTitle ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN;
-    const Color muted  = onTitle ? Fade(SHS_COLOR_ON_PRIMARY, 0.65f) : SHS_COLOR_TEXT_MUTED;
+    const bool tint = onTitle && !ShsThemeClassic();         /* retro themes keep a white field with dark text on the title bar */
+    const Color ink    = tint ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN;
+    const Color muted  = tint ? Fade(SHS_COLOR_ON_PRIMARY, 0.65f) : SHS_COLOR_TEXT_MUTED;
     const float round  = onTitle ? 0.5f : 0.25f;
     (void)round;
-    if (onTitle) {
-        DrawRectangleRounded(r, 0.5f, 16, Fade(SHS_COLOR_ON_PRIMARY, focused ? 0.20f : 0.12f));
-        if (focused) DrawRectangleRoundedLinesEx(r, 0.5f, 16, 1.5f, Fade(SHS_COLOR_ON_PRIMARY, 0.75f));
+    if (tint) {
+        ShsRoundRec(r, 0.5f, 16, Fade(SHS_COLOR_ON_PRIMARY, focused ? 0.20f : 0.12f));
+        if (focused) ShsRoundLines(r, 0.5f, 16, 1.5f, Fade(SHS_COLOR_ON_PRIMARY, 0.75f));
     } else {
-        ShsDrawRoundedBox(r, 9.0f, SHS_COLOR_BG, focused ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
+        ShsDrawRoundedBox(r, 9.0f, ShsThemeClassic() ? SHS_COLOR_CARD : SHS_COLOR_BG, focused ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
     }
     const int pad = icon != SHS_ICON_NONE ? 38 : 12;
     if (icon != SHS_ICON_NONE)
-        ShsDrawIcon(icon, r.x + 20, r.y + r.height / 2, 16.0f, onTitle ? ink : (focused ? SHS_COLOR_PRIMARY : muted));
+        ShsDrawIcon(icon, r.x + 20, r.y + r.height / 2, 16.0f, tint ? ink : (focused ? SHS_COLOR_PRIMARY : muted));
     const char *p = text;
     while (*p && ShsMeasureText(p, 15) > (int)r.width - pad - 12) {    /* keep the tail visible */
         p++;
@@ -344,7 +346,7 @@ static void SaveSettings(void)
     if (!f) return;
     ShsThemeMode m = ShsThemeGetMode();
     fprintf(f, "theme=%s\nstartHidden=%d\ncloseToTray=%d\ndragDialog=%d\ncopyThreads=%d\ncopyBufMB=%d\nquickVerify=%d\nquickUnattended=%d\n",
-            m == SHS_THEME_LIGHT ? "light" : (m == SHS_THEME_DARK ? "dark" : "auto"), g_startHidden ? 1 : 0, g_closeToTray ? 1 : 0,
+            ShsThemeName(m), g_startHidden ? 1 : 0, g_closeToTray ? 1 : 0,
             g_dragDialog ? 1 : 0, g_copyThreads, g_copyBufMiB, g_quickVerify ? 1 : 0, g_quickUnattended ? 1 : 0);
     fclose(f);
 }
@@ -356,8 +358,11 @@ static void LoadSettings(void)
     AppPath(path, sizeof path, "simplesync-settings.txt");
     FILE *f = fopen(path, "rb");
     while (f && fgets(line, sizeof line, f)) {
-        if (strstr(line, "theme=light"))          mode = SHS_THEME_LIGHT;
-        else if (strstr(line, "theme=dark"))      mode = SHS_THEME_DARK;
+        if (!strncmp(line, "theme=", 6)) {
+            char nm[32] = "";
+            sscanf(line + 6, "%31[a-z0-9]", nm);
+            mode = ShsThemeFromName(nm);
+        }
         else if (strstr(line, "startHidden=1"))   g_startHidden = true;
         else if (strstr(line, "closeToTray=1"))   g_closeToTray = true;
         else if (strstr(line, "dragDialog=1"))    g_dragDialog = true;
@@ -425,7 +430,7 @@ static bool Toggle(float x, float y, float w, const char *label, const char *hin
 {
     Rectangle row = { x, y, w, 46 };
     Rectangle sw = { x, y + 3, 44, 24 };
-    DrawRectangleRounded(sw, 1.0f, 16, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
+    ShsRoundRec(sw, 1.0f, 16, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
     DrawCircleV((Vector2){ sw.x + (*value ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
     ShsDrawText(label, (int)x + 58, (int)y + 1, 16, SHS_COLOR_TEXT_MAIN);
     ShsDrawText(hint, (int)x + 58, (int)y + 23, 13, SHS_COLOR_TEXT_MUTED);
@@ -836,8 +841,8 @@ static void DialogSubmit(Dialog *d)
 static void DialogCheck(float x, float y, float w, const char *label, bool *value)
 {
     Rectangle cb = { x, y + 4, 22, 22 };
-    DrawRectangleRounded(cb, 0.25f, 6, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BG);
-    DrawRectangleRoundedLinesEx(cb, 0.25f, 6, 1.0f, SHS_COLOR_BORDER);
+    ShsRoundRec(cb, 0.25f, 6, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BG);
+    ShsRoundLines(cb, 0.25f, 6, 1.0f, SHS_COLOR_BORDER);
     if (*value) {
         DrawLineEx((Vector2){ cb.x + 5, cb.y + 11 }, (Vector2){ cb.x + 10, cb.y + 16 }, 2, SHS_COLOR_ON_PRIMARY);
         DrawLineEx((Vector2){ cb.x + 10, cb.y + 16 }, (Vector2){ cb.x + 17, cb.y + 6 }, 2, SHS_COLOR_ON_PRIMARY);
@@ -935,7 +940,7 @@ static int DropZone(Rectangle r, const char *label, const char *path, const char
         ShsDrawIcon(SHS_ICON_FOLDER, r.x + 30, r.y + 58, 26.0f, SHS_COLOR_PRIMARY);
         DrawTailFit(LastFolder(path), (int)r.x + 54, (int)r.y + 44, 18, (int)r.width - 54 - 40, SHS_COLOR_TEXT_MAIN);
         DrawTailFit(path, (int)r.x + 16, (int)r.y + 88, 13, (int)r.width - 32, SHS_COLOR_TEXT_MUTED);
-        DrawRectangleRounded(clr, 0.4f, 8, clrHot ? SHS_COLOR_CARD_HOVER : Fade(SHS_COLOR_CARD, 0.8f));
+        ShsRoundRec(clr, 0.4f, 8, clrHot ? SHS_COLOR_CARD_HOVER : Fade(SHS_COLOR_CARD, 0.8f));
         ShsDrawIcon(SHS_ICON_CLOSE, clr.x + clr.width / 2, clr.y + clr.height / 2, 12.0f, clrHot ? SHS_COLOR_TEXT_MAIN : SHS_COLOR_TEXT_MUTED);
     }
     if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return clrHot ? 2 : 1;
@@ -1022,8 +1027,8 @@ static void ConflictDraw(int ti, int W, int H)
 
     const float pw = 700, ph = 492;
     Rectangle p = { (float)((W - pw) / 2), (float)((H - ph) / 2), pw, ph };
-    DrawRectangleRounded(p, 0.03f, 10, SHS_COLOR_CARD);
-    DrawRectangleRoundedLinesEx(p, 0.03f, 10, 1.0f, SHS_COLOR_BORDER);
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.03f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.03f, 10, 1.0f, SHS_COLOR_BORDER); }
     ShsDrawText("Destination file already exists", (int)p.x + 24, (int)p.y + 18, 20, SHS_COLOR_TEXT_MAIN);
 
     Rectangle closeR = { p.x + pw - 44, p.y + 12, 32, 32 };               /* the X stops the copy */
@@ -1102,8 +1107,8 @@ static void DialogDraw(Dialog *d, int W, int H)
 
     const float pw = 640, ph = d->quick ? 372 : 428;
     Rectangle p = { (W - pw) / 2, (H - ph) / 2, pw, ph };
-    DrawRectangleRounded(p, 0.04f, 10, SHS_COLOR_CARD);
-    DrawRectangleRoundedLinesEx(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER);
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
     ShsDrawText(d->quick ? "Quick Copy" : (d->editIdx >= 0 ? "Edit Sync Task" : "New Sync Task"), (int)p.x + 24, (int)p.y + 20, 22, SHS_COLOR_TEXT_MAIN);
 
     /* mode switch, top right: Drag & drop folders [switch] */
@@ -1111,7 +1116,7 @@ static void DialogDraw(Dialog *d, int W, int H)
         const char *swLabel = "Drag & drop folders";
         int lw = ShsMeasureText(swLabel, 14);
         Rectangle sw = { p.x + pw - 24 - 44, p.y + 22, 44, 24 };
-        DrawRectangleRounded(sw, 1.0f, 16, d->drag ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
+        ShsRoundRec(sw, 1.0f, 16, d->drag ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
         DrawCircleV((Vector2){ sw.x + (d->drag ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
         ShsDrawText(swLabel, (int)(sw.x - 12 - lw), (int)p.y + 26, 14, SHS_COLOR_TEXT_MUTED);
         Rectangle hit = { sw.x - 16 - lw, sw.y - 4, 16 + lw + 44, 32 };
@@ -1203,18 +1208,42 @@ static void DialogDraw(Dialog *d, int W, int H)
 
 int main(int argc, char **argv)
 {
-    bool multi = false;                                   /* --multi: allow several copies (for measuring / testing) */
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--multi")) multi = true;
+    bool multi = false, restart = false;                  /* --multi: allow several copies (for measuring / testing) */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--multi")) multi = true;
+        if (!strcmp(argv[i], "--restart")) restart = true;   /* started by a theme switch: the old copy is still closing */
+    }
     g_multi = multi;
-    if (!multi && !ShsSingleInstance()) return 0;        /* already running: it was asked to come to the front */
+    if (!multi) {
+        bool first = ShsSingleInstance();
+        for (int tries = 0; !first && restart && tries < 40; tries++) { ShsSleepMs(100); first = ShsSingleInstance(); }
+        if (!first) return 0;                            /* already running: it was asked to come to the front */
+    }
+
+    snprintf(g_appDir, sizeof g_appDir, "%s", GetApplicationDirectory());
+    for (size_t n = strlen(g_appDir); n > 1 && (g_appDir[n - 1] == '/' || g_appDir[n - 1] == '\\'); ) g_appDir[--n] = 0;
+    {   /* square retro themes are chosen before the window exists: they turn anti-aliasing off and load smaller fonts */
+        char sp[600], ln[96];
+        AppPath(sp, sizeof sp, "simplesync-settings.txt");
+        FILE *sf = fopen(sp, "rb");
+        while (sf && fgets(ln, sizeof ln, sf)) {
+            if (!strncmp(ln, "theme=", 6)) {
+                char nm[32] = "";
+                sscanf(ln + 6, "%31[a-z0-9]", nm);
+                if (ShsThemeFromName(nm) >= SHS_THEME_FLAT98) ShsThemeSetMode(ShsThemeFromName(nm));
+            }
+        }
+        if (sf) fclose(sf);
+    }
 
     /* Undecorated (custom title bar) + high-DPI aware; must be set before InitWindow. */
-    SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE |
-                   FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);   /* MSAA keeps the rounded borders smooth */
+    SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT |
+                   (ShsThemeFlat() ? 0 : FLAG_MSAA_4X_HINT));   /* MSAA keeps the rounded borders smooth; Flat 98 has none */
     InitWindow(1080, 650, SHS_APP_TITLE);
     Image appIcon = LoadImageFromMemory(".png", SHS_ICON_PNG, (int)sizeof SHS_ICON_PNG);
     if (appIcon.data) {
         SetWindowIcon(appIcon);
+        if (ShsThemeFlat()) ImageResize(&appIcon, 128, 128);   /* Flat 98: a small logo texture is plenty */
         g_logo = LoadTextureFromImage(appIcon);          /* title bar logo */
         SetTextureFilter(g_logo, TEXTURE_FILTER_BILINEAR);
         Image gray = ImageCopy(appIcon);                  /* grey logo for paused tasks */
@@ -1229,13 +1258,11 @@ int main(int argc, char **argv)
         UnloadImage(gray);
         UnloadImage(appIcon);
     }
-    ShsRoundWindowCorners(GetWindowHandle());
+    if (!ShsThemeFlat()) ShsRoundWindowCorners(GetWindowHandle());
     SetWindowMinSize(860, 540);
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
 
-    snprintf(g_appDir, sizeof g_appDir, "%s", GetApplicationDirectory());
-    for (size_t n = strlen(g_appDir); n > 1 && (g_appDir[n - 1] == '/' || g_appDir[n - 1] == '\\'); ) g_appDir[--n] = 0;
     AppPath(g_tasksFile, sizeof g_tasksFile, "simplesync-tasks.tsv");
     AppPath(g_debugFile, sizeof g_debugFile, "simplesync-debug.log");
     {   /* keep the debug log small: start a new file once it passes 1 MB */
@@ -1271,6 +1298,7 @@ int main(int argc, char **argv)
     Dialog dlg = { 0 };
     Filter filter = FILTER_ALL;
     Nav nav = NAV_TASKS;
+    int tasksTab = 0;                                   /* Tasks page tab: 0 Tasks, 1 Quick copies, 2 Schedule, 3 Archive */
     bool sortByStatus = false, searchFocus = false, shouldClose = false, dragging = false;
     char search[64] = "";
     Vector2 dragGrab = { 0 };
@@ -1331,10 +1359,21 @@ int main(int argc, char **argv)
                 QuickAddPaths(qi, &fl);
                 UnloadDroppedFiles(fl);
             } else {
-                DialogOpen(&dlg, -1); nav = NAV_TASKS;                         /* a folder dropped on the window starts a new task */
+                FilePathList fl = LoadDroppedFiles();
+                nav = NAV_TASKS;
+                if (fl.count > 0 && DirectoryExists(fl.paths[0])) {            /* a folder dropped on the window: Quick Copy, so the folder itself lands in the target */
+                    DialogOpenQuick(&dlg);
+                    snprintf(dlg.src, sizeof dlg.src, "%s", fl.paths[0]);
+                } else if (fl.count > 0) {                                     /* a file: a new task for its folder */
+                    DialogOpen(&dlg, -1);
+                    snprintf(dlg.src, sizeof dlg.src, "%s", GetDirectoryPath(fl.paths[0]));
+                    snprintf(dlg.name, sizeof dlg.name, "%s", LastFolder(dlg.src));
+                }
+                UnloadDroppedFiles(fl);
             }
         }
         ShsThemeUpdate();
+        ShsFontsCheckDpi();
         PollJobs();
         WatchTasks();
         for (int i = 0; i < g_count; i++)                                       /* unattended Quick Copy: remove the finished card */
@@ -1368,12 +1407,18 @@ int main(int argc, char **argv)
         FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, SHS_COLOR_BG);
 
         /* ================= title bar ================= */
-        FillRoundTop((Rectangle){ 0, 0, (float)W, TITLEBAR_H }, g_winR, SHS_COLOR_TITLEBAR);
+        if (ShsThemeClassic()) {
+            ShsDrawTitleBar(W, TITLEBAR_H);
+            Color bk = ShsThemeTitleBack();
+            if (bk.a) DrawRectangle(8, 8, ShsMeasureText(SHS_APP_TITLE, 19) + 54, TITLEBAR_H - 16, bk);          /* patch under logo and title on striped bars */
+        } else FillRoundTop((Rectangle){ 0, 0, (float)W, TITLEBAR_H }, g_winR, SHS_COLOR_TITLEBAR);
         if (g_logo.id) {
             DrawTexturePro(g_logo, (Rectangle){ 0, 0, (float)g_logo.width, (float)g_logo.height },
                            (Rectangle){ 14, 10, 28, 28 }, (Vector2){ 0, 0 }, 0.0f, WHITE);
         }
-        ShsDrawText("SailHighSea SimpleSync", 52, 14, 19, SHS_COLOR_ON_PRIMARY);
+        const Color titleInk = ShsThemeClassic() ? ShsThemeTitleInk() : SHS_COLOR_ON_PRIMARY;
+        ShsDrawText(SHS_APP_TITLE, 52, 14, 19, titleInk);
+        if (ShsThemeFauxBold()) ShsDrawText(SHS_APP_TITLE, 53, 14, 19, titleInk);      /* faux bold */
 
         /* window buttons: 36 x 32 with 6 px gaps and a 12 px right margin, vertically centred in the bar */
         const float wbW = 36, wbH = 32, wbGap = 6, wbY = (TITLEBAR_H - wbH) / 2;
@@ -1389,10 +1434,18 @@ int main(int argc, char **argv)
 
 
         bool hMin = CheckCollisionPointRec(mouse, minB), hMax = CheckCollisionPointRec(mouse, maxB), hClose = CheckCollisionPointRec(mouse, closeB);
-        if (hMin)   DrawRectangleRounded(minB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
-        if (hMax)   DrawRectangleRounded(maxB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
-        if (hClose) DrawRectangleRounded(closeB, 0.4f, 10, SHS_COLOR_DANGER);
-        const Color wInk = SHS_COLOR_ON_PRIMARY;
+        const bool flat98 = ShsThemeClassic();
+        if (flat98) {                                    /* Win98 caption buttons: grey squares with a 1 px border and black glyphs */
+            const Rectangle wbs[3] = { minB, maxB, closeB };
+            const bool wbHot[3] = { hMin, hMax, hClose };
+            for (int i = 0; i < 3; i++)
+                ShsDrawButtonBox(wbs[i], ShsThemeFlat() ? 0.0f : 6.0f, (wbHot[i] && !ShsThemeBevel()) ? (i == 2 ? SHS_COLOR_DANGER : SHS_COLOR_CARD_HOVER) : SHS_COLOR_BG, SHS_COLOR_BORDER, wbHot[i] && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        } else {
+            if (hMin)   ShsRoundRec(minB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
+            if (hMax)   ShsRoundRec(maxB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
+            if (hClose) ShsRoundRec(closeB, 0.4f, 10, SHS_COLOR_DANGER);
+        }
+        const Color wInk = flat98 ? ((hClose && !ShsThemeBevel()) ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN) : SHS_COLOR_ON_PRIMARY;
         const float mcx = minB.x + wbW / 2,   mcy = minB.y + wbH / 2;
         const float xcx = maxB.x + wbW / 2,   xcy = maxB.y + wbH / 2;
         const float ccx = closeB.x + wbW / 2, ccy = closeB.y + wbH / 2;
@@ -1425,34 +1478,43 @@ int main(int argc, char **argv)
 
         /* ================= sidebar ================= */
         Rectangle side = { 0, TITLEBAR_H, SIDEBAR_W, (float)(H - TITLEBAR_H - STATUSBAR_H) };
-        DrawRectangleRec(side, SHS_COLOR_CARD);
+        DrawRectangleRec(side, ShsThemeClassic() ? SHS_COLOR_BG : SHS_COLOR_CARD);
         DrawRectangle(SIDEBAR_W - 1, TITLEBAR_H, 1, (int)side.height, SHS_COLOR_BORDER);
 
-        if (ButtonI((Rectangle){ 16, TITLEBAR_H + 16, SIDEBAR_W - 32, 38 }, "Add Task", SHS_ICON_PLUS, true, false)) {
-            DialogOpen(&dlg, -1);
-            nav = NAV_TASKS;
+        {   /* a newly added card brings its tab to the front */
+            static int prevCount = 0;
+            if (g_count > prevCount) { tasksTab = g_app[g_count - 1].quick ? 1 : 0; nav = NAV_TASKS; }
+            prevCount = g_count;
         }
-        if (ButtonI((Rectangle){ 16, TITLEBAR_H + 62, SIDEBAR_W - 32, 34 }, "Quick Copy", SHS_ICON_COPY, false, false)) {
-            DialogOpenQuick(&dlg);                       /* one-off copy: nothing is saved */
-            nav = NAV_TASKS;
-        }
-        ShsDrawText("NAVIGATION", 20, TITLEBAR_H + 118, 12, SHS_COLOR_TEXT_MUTED);
-        DrawRectangle(20, TITLEBAR_H + 136, SIDEBAR_W - 40, 1, SHS_COLOR_BORDER);
-        for (int i = 0; i < NAV_COUNT; i++) {
-            Rectangle r = { 10, (float)(TITLEBAR_H + 146 + i * 40), SIDEBAR_W - 20, 36 };
-            bool hot = CheckCollisionPointRec(mouse, r);
-            bool on = (int)nav == i;
-            if (on)        DrawRectangleRounded(r, 0.25f, 8, Fade(SHS_COLOR_PRIMARY, 0.25f));
-            else if (hot)  DrawRectangleRounded(r, 0.25f, 8, SHS_COLOR_CARD_HOVER);
-            if (on)        DrawRectangle(10, (int)r.y + 8, 3, 20, SHS_COLOR_PRIMARY);
-            char label[48];
-            if (i == NAV_TASKS) snprintf(label, sizeof label, "%s (%d)", NAV_LABEL[i], g_count);
-            else                snprintf(label, sizeof label, "%s", NAV_LABEL[i]);
+        const char *railTip = NULL;
+        float railTipY = 0;
+        {
+            const float bs = 40, bx = (SIDEBAR_W - bs) / 2;
+            Rectangle addB = { bx, (float)TITLEBAR_H + 12, bs, bs }, quickB = { bx, (float)TITLEBAR_H + 60, bs, bs };
+            if (ButtonI(addB, "", SHS_ICON_PLUS, true, false)) { DialogOpen(&dlg, -1); nav = NAV_TASKS; tasksTab = 0; }
+            if (ButtonI(quickB, "", SHS_ICON_COPY, false, false)) { DialogOpenQuick(&dlg); nav = NAV_TASKS; tasksTab = 1; }   /* one-off copy: nothing is saved */
+            if (CheckCollisionPointRec(mouse, addB))   { railTip = "Add Task";   railTipY = addB.y + bs / 2; }
+            if (CheckCollisionPointRec(mouse, quickB)) { railTip = "Quick Copy"; railTipY = quickB.y + bs / 2; }
+            DrawRectangle(14, TITLEBAR_H + 112, SIDEBAR_W - 28, 1, SHS_COLOR_BORDER);
             static const ShsIcon navIcon[NAV_COUNT] = { SHS_ICON_TASKS, SHS_ICON_TRAFFIC, SHS_ICON_LOGS, SHS_ICON_GEAR, SHS_ICON_INFO };
-            Color navInk = on ? SHS_COLOR_TEXT_MAIN : SHS_COLOR_TEXT_MUTED;
-            ShsDrawIcon(navIcon[i], 36, r.y + r.height / 2, 18.0f, on ? SHS_COLOR_PRIMARY : navInk);
-            ShsDrawText(label, 54, (int)r.y + 10, 16, navInk);
-            if (hot && Pressed()) nav = (Nav)i;
+            for (int i = 0; i < NAV_COUNT; i++) {
+                Rectangle r = { bx, (float)(TITLEBAR_H + 124 + i * 48), bs, bs };
+                bool hot = CheckCollisionPointRec(mouse, r), on = (int)nav == i;
+                if (ShsThemeBevel()) ShsDrawBevel(r, on || (hot && !g_block && IsMouseButtonDown(MOUSE_BUTTON_LEFT)), SHS_COLOR_BG);
+                else {
+                    if (on)       ShsRoundRec(r, 0.25f, 8, Fade(SHS_COLOR_PRIMARY, 0.25f));
+                    else if (hot) ShsRoundRec(r, 0.25f, 8, SHS_COLOR_CARD_HOVER);
+                    if (on)       DrawRectangle(0, (int)r.y + 10, 3, 20, SHS_COLOR_PRIMARY);
+                }
+                ShsDrawIcon(navIcon[i], r.x + bs / 2, r.y + bs / 2, 20.0f, on ? SHS_COLOR_PRIMARY : SHS_COLOR_TEXT_MUTED);
+                if (hot) {
+                    static char tipBuf[48];
+                    if (i == NAV_TASKS) snprintf(tipBuf, sizeof tipBuf, "%s (%d)", NAV_LABEL[i], g_count);
+                    else                snprintf(tipBuf, sizeof tipBuf, "%s", NAV_LABEL[i]);
+                    railTip = tipBuf; railTipY = r.y + bs / 2;
+                    if (Pressed()) nav = (Nav)i;
+                }
+            }
         }
 
         /* ================= main pane ================= */
@@ -1460,9 +1522,33 @@ int main(int argc, char **argv)
         float py = TITLEBAR_H + 16;
 
         if (nav == NAV_TASKS) {
-            char sum[128];
-            snprintf(sum, sizeof sum, "GLOBAL SUMMARY: %d Active  |  %d Idle  |  %d Alert  |  %d Paused", nActive, nIdle, nErr, nPaused);
-            ShsDrawText(sum, (int)px, (int)py + 9, 15, SHS_COLOR_TEXT_MAIN);
+            Rectangle activeTabR = { 0 };                       /* Win98: the selected tab is drawn over the divider */
+            int nQuick = 0;
+            for (int i = 0; i < g_count; i++) if (g_app[i].quick) nQuick++;
+            {   /* page tabs */
+                char tl[4][32];
+                snprintf(tl[0], sizeof tl[0], "Tasks (%d)", g_count - nQuick);
+                snprintf(tl[1], sizeof tl[1], "Quick copies (%d)", nQuick);
+                snprintf(tl[2], sizeof tl[2], "Schedule");
+                snprintf(tl[3], sizeof tl[3], "Archive");
+                float tx = px;
+                for (int i = 0; i < 4; i++) {
+                    float tw = (float)ShsMeasureText(tl[i], 17) + 28;
+                    Rectangle tr = { tx, py, tw, 38 };
+                    bool hot = CheckCollisionPointRec(mouse, tr), on = tasksTab == i;
+                    Color tabInk = on ? SHS_COLOR_PRIMARY : SHS_COLOR_TEXT_MUTED;
+                    int tabTextY = (int)py + 9;
+                    if (ShsThemeFolderTabs() || ShsThemeBevel()) {       /* retro themes: folder tabs, the selected one a little taller */
+                        Rectangle bt = on ? (Rectangle){ tx, py + 1, tw, 40 } : (Rectangle){ tx, py + 5, tw, 34 };
+                        tabInk = ShsDrawTab(bt, on);
+                        if (on) activeTabR = bt;
+                        tabTextY = (int)py + (on ? 9 : 12);
+                    } else if (hot && !on) ShsRoundRec((Rectangle){ tr.x, tr.y + 2, tr.width, 32 }, 0.25f, 8, SHS_COLOR_CARD_HOVER);
+                    ShsDrawText(tl[i], (int)(tx + 14), tabTextY, 17, tabInk);
+                    if (on && !ShsThemeFolderTabs() && !ShsThemeBevel()) DrawRectangle((int)tx, (int)py + 36, (int)tw, 3, SHS_COLOR_PRIMARY);
+                    tx += tw + 6;
+                }
+            }
             Rectangle syncAll = { px + pw - 110, py, 110, 32 };
             Rectangle pauseAll = { syncAll.x - 126, py, 118, 32 };
             if (ButtonI(pauseAll, "Pause All", SHS_ICON_PAUSE, false, false))
@@ -1473,27 +1559,43 @@ int main(int argc, char **argv)
                     else if (!g_app[i].quick) StartTask(i);
                 }
             }
-            DrawRectangle((int)px, (int)py + 42, (int)pw, 1, SHS_COLOR_BORDER);
+            DrawRectangle((int)px, (int)py + 38, (int)pw, 1, SHS_COLOR_BORDER);
+            if (ShsThemeBevel()) DrawRectangle((int)px, (int)py + 39, (int)pw, 1, WHITE);
+            if (activeTabR.width > 0) DrawRectangle((int)activeTabR.x + 2, (int)py + 38, (int)activeTabR.width - 4, 3, ShsThemeTabFill());     /* open the active tab into the page */
 
-            struct { const char *name; int count; } fl[4] = {
-                { "All", g_count }, { "Active", nActive }, { "Errors", nErr }, { "Paused", nPaused } };
-            float fx = px, fy = py + 54;
-            ShsDrawText("FILTERS:", (int)fx, (int)fy + 8, 13, SHS_COLOR_TEXT_MUTED);
-            fx += 80;
-            static const ShsIcon filterIcon[4] = { SHS_ICON_GRID, SHS_ICON_SYNC, SHS_ICON_WARN, SHS_ICON_PAUSE };
-            for (int i = 0; i < 4; i++) {
-                char lb[32];
-                snprintf(lb, sizeof lb, "%s (%d)", fl[i].name, fl[i].count);
-                float bw = (float)ShsMeasureText(lb, 15) + 28 + 24;
-                if (ButtonI((Rectangle){ fx, fy, bw, 30 }, lb, filterIcon[i], false, filter == (Filter)i)) { filter = (Filter)i; view.scrollTarget = 0; }
-                fx += bw + 8;
+            const bool listTab = tasksTab < 2;
+            int tabAll = 0, tabActive = 0, tabErr = 0, tabPaused = 0;      /* counts for the current tab */
+            for (int i = 0; i < g_count; i++) {
+                if (g_app[i].quick != (tasksTab == 1)) continue;
+                tabAll++;
+                switch (views[i].state) {
+                    case SHS_TASK_SYNCING: tabActive++; break;
+                    case SHS_TASK_ERROR:   tabErr++; break;
+                    case SHS_TASK_PAUSED:  tabPaused++; break;
+                    default: break;
+                }
             }
-            DrawRectangle((int)px, (int)fy + 40, (int)pw, 1, SHS_COLOR_BORDER);
-
-            float hy = fy + 52;
-            ShsDrawText("SYNC TASK LIST / RULES", (int)px, (int)hy + 8, 13, SHS_COLOR_TEXT_MUTED);
-            if (ButtonI((Rectangle){ px + pw - 160, hy, 160, 30 }, sortByStatus ? "Sorted by Status" : "Sort by Status", SHS_ICON_SORT, false, sortByStatus))
-                sortByStatus = !sortByStatus;
+            struct { const char *name; int count; } fl[4] = {
+                { "All", tabAll }, { "Active", tabActive }, { "Errors", tabErr }, { "Paused", tabPaused } };
+            float fx = px, fy = py + 50;
+            if (listTab) {
+                ShsDrawText("Filter:", (int)fx, (int)fy + 8, 14, SHS_COLOR_TEXT_MUTED);
+                fx += 56;
+                static const ShsIcon filterIcon[4] = { SHS_ICON_GRID, SHS_ICON_SYNC, SHS_ICON_WARN, SHS_ICON_PAUSE };
+                for (int i = 0; i < 4; i++) {
+                    char lb[32];
+                    snprintf(lb, sizeof lb, "%s (%d)", fl[i].name, fl[i].count);
+                    float bw = (float)ShsMeasureText(lb, 15) + 28 + 24;
+                    if (ButtonI((Rectangle){ fx, fy, bw, 30 }, lb, filterIcon[i], false, filter == (Filter)i)) { filter = (Filter)i; view.scrollTarget = 0; }
+                    fx += bw + 8;
+                }
+                if (ButtonI((Rectangle){ px + pw - 160, fy, 160, 30 }, sortByStatus ? "Sorted by Status" : "Sort by Status", SHS_ICON_SORT, false, sortByStatus))
+                    sortByStatus = !sortByStatus;
+            } else {
+                ShsDrawText(tasksTab == 2 ? "Scheduled syncs are not available yet." : "Archived tasks are not available yet.",
+                            (int)px + 8, (int)fy + 16, 16, SHS_COLOR_TEXT_MUTED);
+            }
+            float hy = fy - 2;                       /* the list starts 42 below this */
 
             /* filtered (and optionally sorted) copy; shownIdx maps back to g_app */
             static ShsTask shown[MAX_TASKS];
@@ -1503,6 +1605,7 @@ int main(int argc, char **argv)
                 for (int i = 0; i < g_count; i++) {
                     const ShsTask *t = &views[i];
                     if (sortByStatus && StatusRank(t->state) != pass) continue;
+                    if (!listTab || g_app[i].quick != (tasksTab == 1)) continue;
                     bool ok = filter == FILTER_ALL ||
                               (filter == FILTER_ACTIVE && t->state == SHS_TASK_SYNCING) ||
                               (filter == FILTER_ERRORS && t->state == SHS_TASK_ERROR) ||
@@ -1570,7 +1673,10 @@ int main(int argc, char **argv)
             }
 
             if (shownCount == 0 && g_count == 0)
-                ShsDrawText("Click \"+ Add Task\" to create your first sync task.", (int)px + 8, (int)listB.y + 40, 16, SHS_COLOR_TEXT_MUTED);        } else {
+                ShsDrawText("Click the + button on the left to create your first sync task.", (int)px + 8, (int)listB.y + 40, 16, SHS_COLOR_TEXT_MUTED);
+            else if (shownCount == 0 && listTab && tasksTab == 1 && g_count > 0 && tabAll == 0)
+                ShsDrawText("No quick copies. Use the copy button on the left to start one.", (int)px + 8, (int)listB.y + 40, 16, SHS_COLOR_TEXT_MUTED);
+        } else {
             ShsDrawText(NAV_LABEL[nav], (int)px, (int)py, 26, SHS_COLOR_TEXT_MAIN);
             if (nav == NAV_LOGS) {
                 ShsDrawText("Full debug log: simplesync-debug.log, next to the app", (int)px + 160, (int)py + 11, 13, SHS_COLOR_TEXT_MUTED);
@@ -1597,17 +1703,21 @@ int main(int argc, char **argv)
                 }
             } else if (nav == NAV_SETTINGS) {
                 ShsDrawText("APPEARANCE", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
-                static const char *const modeName[3] = { "System", "Light", "Dark" };
-                for (int m = 0; m < 3; m++) {
-                    if (Button((Rectangle){ px + m * 110, y + 22, 100, 34 }, modeName[m], false, (int)ShsThemeGetMode() == m)) {
+                for (int m = 0; m < SHS_THEME_COUNT; m++) {                 /* two rows of theme buttons */
+                    const float bwid = 120;
+                    int col = m < 5 ? m : m - 5, row = m < 5 ? 0 : 1;
+                    if (Button((Rectangle){ px + col * (bwid + 8), y + 22 + row * 40, bwid, 34 }, ShsThemeLabel((ShsThemeMode)m), false, (int)ShsThemeGetMode() == m)) {
+                        bool wasFlat = ShsThemeFlat();
                         ShsThemeSetMode((ShsThemeMode)m);
                         SaveSettings();
+                        if (wasFlat != ShsThemeFlat()) { g_restart = true; shouldClose = true; }   /* anti-aliasing and fonts are fixed at start-up */
                     }
                 }
                 char look[96];
-                snprintf(look, sizeof look, "Using the %s theme", ShsThemeIsDark() ? "dark" : "light");
-                ShsDrawText(look, (int)px + 340, (int)y + 31, 14, SHS_COLOR_TEXT_MUTED);
-                y += 84;
+                snprintf(look, sizeof look, "Using the %s theme", ShsThemeClassic() ? ShsThemeLabel(ShsThemeGetMode()) : (ShsThemeIsDark() ? "dark" : "light"));
+                ShsDrawText(look, (int)px + 5 * 128 + 8, (int)y + 31, 14, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Themes with square corners (Flat 98, Win98, Mac System 7, Linux CDE) restart the app when you switch to or from them. They use less memory.", (int)px, (int)y + 102, 13, SHS_COLOR_TEXT_MUTED);
+                y += 124;
 
                 ShsDrawText("STARTUP", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
                 float ty = y + 24;
@@ -1714,6 +1824,13 @@ int main(int argc, char **argv)
             }
         }
 
+        if (railTip && !g_block) {                       /* icon rail tooltip, drawn over the page */
+            int tw = ShsMeasureText(railTip, 15);
+            Rectangle tr = { SIDEBAR_W + 4, railTipY - 14, (float)tw + 20, 28 };
+            ShsDrawRoundedBox(tr, 7.0f, SHS_COLOR_CARD, SHS_COLOR_BORDER);
+            ShsDrawText(railTip, (int)tr.x + 10, (int)tr.y + 6, 15, SHS_COLOR_TEXT_MAIN);
+        }
+
         /* tray tooltip follows the sync state */
         if (ShsTrayActive()) {
             static char lastTip[96] = "";
@@ -1725,8 +1842,16 @@ int main(int argc, char **argv)
         }
 
         /* ================= status bar ================= */
-        FillRoundBottom((Rectangle){ 0, (float)(H - STATUSBAR_H), (float)W, STATUSBAR_H }, g_winR, SHS_COLOR_CARD);
+        FillRoundBottom((Rectangle){ 0, (float)(H - STATUSBAR_H), (float)W, STATUSBAR_H }, g_winR, ShsThemeClassic() ? SHS_COLOR_BG : SHS_COLOR_CARD);
         DrawRectangle(0, H - STATUSBAR_H, W, 1, SHS_COLOR_BORDER);
+        if (ShsThemeBevel()) {                                      /* Win98: sunken status panels */
+            const float spy = (float)(H - STATUSBAR_H + 3), sph = STATUSBAR_H - 5;
+            const float verW = (float)ShsMeasureText("SailHighSea Engine v" SHS_VERSION, 14);
+            ShsDrawBevelFrame((Rectangle){ 4, spy, 218, sph }, true);
+            ShsDrawBevelFrame((Rectangle){ 224, spy, 196, sph }, true);
+            ShsDrawBevelFrame((Rectangle){ 424, spy, 230, sph }, true);
+            ShsDrawBevelFrame((Rectangle){ (float)W - verW - 30, spy, verW + 26, sph }, true);
+        }
         int sy = H - STATUSBAR_H + 8;
         DrawCircle(20, H - STATUSBAR_H / 2, 4.5f, nActive ? SHS_COLOR_PRIMARY : SHS_COLOR_SUCCESS);
         ShsDrawText(nActive ? "Engine Status: SYNCING" : "Engine Status: READY", 32, sy, 14, SHS_COLOR_TEXT_MAIN);
@@ -1747,7 +1872,8 @@ int main(int argc, char **argv)
         if (conflictTask >= 0 && g_app[conflictTask].job) ConflictDraw(conflictTask, W, H);
         g_block = false;
 
-        if (g_winR >= 0.5f) DrawRectangleRoundedLinesEx((Rectangle){ 0, 0, (float)W, (float)H }, RoundNess((Rectangle){ 0, 0, (float)W, (float)H }, g_winR), 16, 1.0f, SHS_COLOR_BORDER);
+        if (g_winR >= 0.5f) ShsRoundLines((Rectangle){ 0, 0, (float)W, (float)H }, RoundNess((Rectangle){ 0, 0, (float)W, (float)H }, g_winR), 16, 1.0f, SHS_COLOR_BORDER);
+        else if (ShsThemeBevel()) ShsDrawBevelFrame((Rectangle){ 0, 0, (float)W, (float)H }, false);
         else                DrawRectangleLines(0, 0, W, H, SHS_COLOR_BORDER);   /* no OS frame */
         EndDrawing();
     }
@@ -1758,5 +1884,6 @@ int main(int argc, char **argv)
     if (g_logo.id) UnloadTexture(g_logo);
     if (g_logoGray.id) UnloadTexture(g_logoGray);
     CloseWindow();
+    if (g_restart) ShsRelaunch(argc, argv);
     return 0;
 }

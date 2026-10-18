@@ -185,6 +185,22 @@ static DWORD WINAPI ShowWaiter(LPVOID ev)
 void ShsTrimMemory(void) { SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }
 void ShsSleepMs(unsigned ms) { Sleep(ms); }
 
+bool ShsRelaunch(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    const wchar_t *cur = GetCommandLineW();
+    size_t n = wcslen(cur) + 16;
+    wchar_t *cmd = (wchar_t *)malloc(n * sizeof(wchar_t));
+    if (!cmd) return false;
+    swprintf(cmd, n, L"%ls --restart", cur);
+    STARTUPINFOW si = { sizeof si };
+    PROCESS_INFORMATION pi;
+    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+    free(cmd);
+    if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    return ok != 0;
+}
+
 bool ShsSingleInstance(void)
 {
     HANDLE m = CreateMutexW(NULL, FALSE, L"Local\\SailHighSea.SimpleSync.Instance");
@@ -414,6 +430,21 @@ static bool ExePath(char *out, size_t cap)
     out[n] = 0;
     return true;
   #endif
+}
+
+bool ShsRelaunch(int argc, char **argv)
+{
+    char exe[1024];
+    if (!ExePath(exe, sizeof exe)) return false;
+    char **av = (char **)calloc((size_t)argc + 2, sizeof *av);
+    if (!av) return false;
+    av[0] = exe;
+    for (int i = 1; i < argc; i++) av[i] = argv[i];
+    av[argc] = (char *)"--restart";
+    pid_t pid = fork();
+    if (pid == 0) { setsid(); usleep(400000); execv(exe, av); _exit(1); }
+    free(av);
+    return pid > 0;
 }
 
 static bool AutostartFile(char *out, size_t cap)

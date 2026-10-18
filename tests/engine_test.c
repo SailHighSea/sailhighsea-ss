@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -450,6 +451,51 @@ int main(int argc, char **argv)
             CHECK(SizeOf(cdst, "a.txt") == 1000 && SizeOf(cdst, "b.txt") == 3000);
         }
         RemoveTree(csrc); RemoveTree(cdst);
+    }
+
+    /* ---- many small files in a deep tree: parallel scan finds everything, direct writes leave no temp files ---- */
+    {
+        printf("many small files (parallel scan, direct writes)\n");
+        char msrc[700], mdst[700], p[900];
+        snprintf(msrc, sizeof msrc, "%s/many_src", g_base);
+        snprintf(mdst, sizeof mdst, "%s/many_dst", g_base);
+        RemoveTree(msrc); RemoveTree(mdst);
+        MKDIR(msrc);
+        int made = 0;
+        for (int a = 0; a < 6; a++) {
+            snprintf(p, sizeof p, "%s/d%d", msrc, a); MKDIR(p);
+            for (int b = 0; b < 6; b++) {
+                snprintf(p, sizeof p, "%s/d%d/e%d", msrc, a, b); MKDIR(p);
+                for (int c = 0; c < 2; c++) {
+                    snprintf(p, sizeof p, "%s/d%d/e%d/f%d", msrc, a, b, c); MKDIR(p);
+                    for (int k = 0; k < 8; k++) {
+                        snprintf(p, sizeof p, "%s/d%d/e%d/f%d/s%d.bin", msrc, a, b, c, k);
+                        MakeFilled(p, 100 + (size_t)(a * 31 + b * 7 + c * 3 + k) * 13, (unsigned)(made + 100));
+                        made++;
+                    }
+                }
+            }
+        }
+        ShsSyncConfigure(4, 64);
+        clock_t t0 = clock();
+        ShsSyncStatus ms = RunSyncPaths(msrc, mdst, false);
+        printf("  %d files copied in %ld ms\n", made, (long)((clock() - t0) * 1000 / CLOCKS_PER_SEC));
+        CHECK(ms.state == SHS_SYNC_DONE && ms.errorCount == 0);
+        CHECK(ms.filesDone == (uint64_t)made && ms.filesTotal == (uint64_t)made);
+        CHECK(SizeOf(mdst, "d0/e0/f0/s0.bin") == 100);
+        CHECK(SizeOf(mdst, "d5/e5/f1/s7.bin") == 100 + (5 * 31 + 5 * 7 + 1 * 3 + 7) * 13);
+        CHECK(SizeOf(mdst, "d3/e2/f1/s4.bin.shs-tmp") < 0);                        /* no temp files left behind */
+        ShsSyncStatus again = RunSyncPaths(msrc, mdst, false);                   /* second run: nothing to copy */
+        CHECK(again.state == SHS_SYNC_DONE && again.filesTotal == 0);
+        snprintf(p, sizeof p, "%s/d2/e3/f0/s1.bin", msrc); MakeFilled(p, 5000, 7);   /* a changed file goes through the temp file + rename */
+        ShsSyncStatus chg = RunSyncPaths(msrc, mdst, false);
+        CHECK(chg.state == SHS_SYNC_DONE && chg.filesDone == 1);
+        CHECK(SizeOf(mdst, "d2/e3/f0/s1.bin") == 5000);
+        snprintf(p, sizeof p, "%s/d1/e1/f1/s1.bin", msrc); remove(p);               /* mirror deletes what is gone from the source */
+        ShsSyncStatus mir = RunSyncPaths(msrc, mdst, true);
+        CHECK(mir.state == SHS_SYNC_DONE && mir.filesDeleted == 1);
+        CHECK(SizeOf(mdst, "d1/e1/f1/s1.bin") < 0);
+        RemoveTree(msrc); RemoveTree(mdst);
     }
 
     /* ---- an unreadable folder in the target (like "System Volume Information" on a USB stick) must not fail the copy ---- */

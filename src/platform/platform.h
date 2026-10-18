@@ -42,6 +42,9 @@ bool ShsSingleInstance(void);
    again on demand. Call when the app has been idle for a while. No-op elsewhere. */
 void ShsTrimMemory(void);
 
+/* Starts a fresh copy of this program (same arguments plus --restart, which makes it wait for this copy to exit). Returns false on failure. */
+bool ShsRelaunch(int argc, char **argv);
+
 /* Sleeps without spinning (unlike raylib's WaitTime, which busy-waits for its last few percent). */
 void ShsSleepMs(unsigned ms);
 int  ShsTrayPoll(void);                     /* returns and clears the SHS_TRAY_* events since the last call */
