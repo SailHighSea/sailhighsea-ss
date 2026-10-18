@@ -1546,6 +1546,7 @@ int main(int argc, char **argv)
                     } else if (hot && !on) ShsRoundRec((Rectangle){ tr.x, tr.y + 2, tr.width, 32 }, 0.25f, 8, SHS_COLOR_CARD_HOVER);
                     ShsDrawText(tl[i], (int)(tx + 14), tabTextY, 17, tabInk);
                     if (on && !ShsThemeFolderTabs() && !ShsThemeBevel()) DrawRectangle((int)tx, (int)py + 36, (int)tw, 3, SHS_COLOR_PRIMARY);
+                    if (hot && Pressed()) { tasksTab = i; view.scrollTarget = 0; }
                     tx += tw + 6;
                 }
             }
@@ -1672,10 +1673,12 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (shownCount == 0 && g_count == 0)
-                ShsDrawText("Click the + button on the left to create your first sync task.", (int)px + 8, (int)listB.y + 40, 16, SHS_COLOR_TEXT_MUTED);
-            else if (shownCount == 0 && listTab && tasksTab == 1 && g_count > 0 && tabAll == 0)
-                ShsDrawText("No quick copies. Use the copy button on the left to start one.", (int)px + 8, (int)listB.y + 40, 16, SHS_COLOR_TEXT_MUTED);
+            if (listTab && shownCount == 0) {
+                const char *none = tabAll > 0 ? "Nothing matches the current filter or search."
+                                 : (tasksTab == 1 ? "No quick copies. Use the copy button on the left to start one."
+                                                  : "Click the + button on the left to create your first sync task.");
+                ShsDrawText(none, (int)px + 8, (int)listB.y + 16, 16, SHS_COLOR_TEXT_MUTED);
+            }
         } else {
             ShsDrawText(NAV_LABEL[nav], (int)px, (int)py, 26, SHS_COLOR_TEXT_MAIN);
             if (nav == NAV_LOGS) {

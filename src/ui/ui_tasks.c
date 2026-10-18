@@ -902,9 +902,5 @@ ShsTaskEvent ShsTaskListDraw(ShsTaskView *view, const ShsTask *tasks, int count,
         ShsRoundRec((Rectangle){ trackX, thumbY, SCROLLBAR_W, thumbH }, 1.0f, 6, SHS_COLOR_BORDER);
     }
     EndScissorMode();
-
-    if (count == 0)
-        ShsDrawText("No sync tasks yet.", (int)bounds.x + 8, (int)bounds.y + 8, 18, SHS_COLOR_TEXT_MUTED);
-
     return ev;
 }
