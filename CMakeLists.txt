@@ -67,8 +67,13 @@ enable_testing()
 add_executable(engine_test
     tests/engine_test.c
     src/engine/sync_engine.c
-    src/engine/task_store.c)
-target_include_directories(engine_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/engine")
+    src/engine/task_store.c
+    src/platform/updater.c
+    src/platform/drives.c)
+target_include_directories(engine_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/engine" "${CMAKE_CURRENT_SOURCE_DIR}/src/platform")
+if(WIN32)
+    target_link_libraries(engine_test PRIVATE winhttp)
+endif()
 target_link_libraries(engine_test PRIVATE Threads::Threads)
 set_target_properties(engine_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
@@ -77,7 +82,7 @@ endforeach()
 add_test(NAME engine_test COMMAND engine_test "${CMAKE_BINARY_DIR}/tests/sandbox")
 
 if(WIN32)
-    target_link_libraries(SailHighSea-SimpleSync PRIVATE ole32 shell32 uuid advapi32)
+    target_link_libraries(SailHighSea-SimpleSync PRIVATE ole32 shell32 uuid advapi32 winhttp)
     # GUI subsystem (no console window) in non-Debug builds, keeping plain main().
     if(MSVC)
         target_link_options(SailHighSea-SimpleSync PRIVATE

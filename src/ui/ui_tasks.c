@@ -59,6 +59,101 @@ static const char *FitText(char *out, size_t cap, const char *text, int size, fl
     return out;
 }
 
+/* ---- file paths in lists ---------------------------------------------------------------------------------------------
+   The file name is what matters, so it stays whole and the folders around it shrink instead:
+     D:\Work\241 Suburban Rail Loop\Tender preparation\10 Subcontractor Packs\10.2 Quality\Report_rev1.pdf
+     D:\..\10.2 Quality\Report_rev1.pdf   ->   D:\..\10.2 Qual..\Report_rev1.pdf   ->   ..\10.2 Q..\Report_rev1.pdf   ->   ..\Report_rev1.pdf */
+
+#ifdef _WIN32
+  #define PATH_SEP "\\"
+#else
+  #define PATH_SEP "/"
+#endif
+
+/* Appends `seg` cut to `keep` characters (UTF-8 safe) plus ".."; keep 0 = the whole segment. */
+static void AppendCut(char *out, size_t cap, const char *seg, size_t segLen, int keep)
+{
+    size_t n = strlen(out), take = segLen;
+    bool cut = false;
+    if (keep > 0) {
+        size_t chars = 0, i = 0;
+        while (i < segLen && chars < (size_t)keep) { i++; while (i < segLen && ((unsigned char)seg[i] & 0xC0) == 0x80) i++; chars++; }
+        if (i < segLen) { take = i; cut = true; }
+    }
+    if (n + take + 3 >= cap) return;
+    memcpy(out + n, seg, take);
+    out[n + take] = 0;
+    if (cut) strcat(out, "..");
+}
+
+/* Middle-ellipsis for a name that is still too wide: "very_long_na..ame_rev1.pdf" (keeps the start and the extension). */
+static void MidEllipsis(char *out, size_t cap, const char *name, int size, float maxW)
+{
+    size_t len = strlen(name);
+    for (size_t head = len; head-- > 1; ) {
+        char buf[SHS_TASK_PATH_MAX + 8];
+        size_t tail = 0;
+        while (head + 2 + tail < len && tail < 12) tail++;
+        size_t t0 = len - tail;
+        while (t0 < len && ((unsigned char)name[t0] & 0xC0) == 0x80) t0++;
+        size_t h = head;
+        while (h > 0 && ((unsigned char)name[h] & 0xC0) == 0x80) h--;
+        snprintf(buf, sizeof buf, "%.*s..%s", (int)h, name, name + t0);
+        if (ShsMeasureText(buf, size) <= maxW) { snprintf(out, cap, "%s", buf); return; }
+    }
+    snprintf(out, cap, "..");
+}
+
+static const char *ShortenPath(char *out, size_t cap, const char *path, int size, float maxW)
+{
+    if (ShsMeasureText(path, size) <= maxW) { snprintf(out, cap, "%s", path); return out; }
+
+    const char *segS[64]; size_t segL[64]; int n = 0;                       /* split on / and \ */
+    const char *p = path;
+    while (*p && n < 64) {
+        const char *e = p;
+        while (*e && *e != '/' && *e != '\\') e++;
+        if (e > p) { segS[n] = p; segL[n] = (size_t)(e - p); n++; }
+        p = *e ? e + 1 : e;
+    }
+    if (n < 2) { MidEllipsis(out, cap, path, size, maxW); return out; }
+
+    const char *file = segS[n - 1]; const size_t fileL = segL[n - 1];
+    const char *par  = segS[n - 2]; const size_t parL  = segL[n - 2];
+    static const int KEEP[] = { 0, 28, 20, 14, 9, 5 };                       /* how many characters of each folder name survive */
+    for (size_t k = 0; k < sizeof KEEP / sizeof KEEP[0]; k++) {
+        for (int withFirst = 1; withFirst >= 0; withFirst--) {
+            if (withFirst && n < 3) continue;
+            out[0] = 0;
+            if (withFirst) {
+                AppendCut(out, cap, segS[0], segL[0], KEEP[k]);
+                strcat(out, PATH_SEP);
+                if (n > 3) { strcat(out, ".."); strcat(out, PATH_SEP); }       /* folders in between are left out */
+                if (n > 2) { AppendCut(out, cap, par, parL, KEEP[k]); strcat(out, PATH_SEP); }
+            } else {
+                strcat(out, ".."); strcat(out, PATH_SEP);
+                if (n > 2) { AppendCut(out, cap, par, parL, KEEP[k]); strcat(out, PATH_SEP); }
+            }
+            AppendCut(out, cap, file, fileL, 0);
+            if (ShsMeasureText(out, size) <= maxW) return out;
+        }
+    }
+    char name[SHS_TASK_PATH_MAX];                                            /* last resort: ..\<name shortened in the middle> */
+    snprintf(name, sizeof name, "%.*s", (int)fileL, file);
+    const float lead = (float)ShsMeasureText(".." PATH_SEP, size);
+    MidEllipsis(out, cap, name, size, maxW - lead);
+    char tmp[SHS_TASK_PATH_MAX + 8];
+    snprintf(tmp, sizeof tmp, ".." PATH_SEP "%s", out);
+    snprintf(out, cap, "%s", tmp);
+    return out;
+}
+
+static void DrawPathFit(const char *path, float x, float y, int size, float maxW, Color c)
+{
+    char buf[SHS_TASK_PATH_MAX + 16];
+    ShsDrawText(ShortenPath(buf, sizeof buf, path, size, maxW), (int)x, (int)y, size, c);
+}
+
 static void DrawTextFit(const char *text, float x, float y, int size, float maxW, Color c, bool keepTail)
 {
     char buf[SHS_TASK_PATH_MAX + 8];
@@ -207,7 +302,7 @@ static void DrawFileLine(const ShsTask *t, float x, float y, float w)
 {
     ShsDrawText("File:", (int)x, (int)y, 13, SHS_COLOR_TEXT_MUTED);
     int fw = ShsMeasureText("File: ", 13);
-    DrawTextFit(t->currentFile, x + fw, y, 13, w - fw, SHS_COLOR_TEXT_MUTED, true);
+    DrawPathFit(t->currentFile, x + fw, y, 13, w - fw, SHS_COLOR_TEXT_MUTED);
 }
 /* ---- icon buttons ----------------------------------------------------- */
 
@@ -256,10 +351,12 @@ static float s_listH = 600.0f;                                  /* height of the
 /* The Quick Copy panel fills the viewport below the card, between a minimum and the full layout. */
 static float QuickPanelHeight(void) { return fminf(6.0f + 38.0f + 296.0f + 6.0f, fmaxf(250.0f, s_listH - 142.0f - 4.0f)); }
 
+#define SUM_ROWS_MAX 8   /* rows visible at once in the list behind a summary tab */
+
 static float PanelHeight(const ShsTask *t)
 {
     if (t->quick) return QuickPanelHeight();
-    int rows = t->fileCount > 0 ? t->fileCount : 1;
+    int rows = t->selRows > 0 ? (t->selRows < SUM_ROWS_MAX ? t->selRows : SUM_ROWS_MAX) : (t->fileCount > 0 ? t->fileCount : 1);
     return 12.0f + PANEL_HEAD + rows * FILE_ROW_H + 8.0f;
 }
 
@@ -270,20 +367,110 @@ static float CardHeightNow(const ShsTaskView *v, const ShsTask *t)
     return h + PanelHeight(t) * v->expandT[id];
 }
 
-static void DrawFilePanel(const ShsTask *t, Rectangle r, float baseH, float x, float w)
+
+/* One row of the file list: state icon, name, size and (while copying) a progress bar. */
+static void DrawFileRow(const char *name, unsigned long long size, unsigned long long done, int state, float x, float ry, float w, float rightPad)
 {
+    float cy = ry + FILE_ROW_H / 2;
+    Color col; ShsIcon ic;
+    switch (state) {
+        case 1:  col = SHS_COLOR_SUCCESS;    ic = SHS_ICON_CHECK;  break;
+        case 2:  col = SHS_COLOR_DANGER;     ic = SHS_ICON_WARN;   break;
+        case 3:  col = SHS_COLOR_TEXT_MUTED; ic = SHS_ICON_TRASH;  break;
+        case 4:  col = SHS_COLOR_TEXT_MUTED; ic = SHS_ICON_CLOSE;  break;       /* skipped */
+        case 8:  col = SHS_COLOR_TEXT_MUTED; ic = SHS_ICON_CLOSE;  break;       /* temp / lock file left out */
+        default: col = SHS_COLOR_PRIMARY;    ic = SHS_ICON_SYNC;   break;
+    }
+    ShsDrawIcon(ic, x + 10, cy, 14.0f, col);
+
+    w -= rightPad;
+    char sz[24];
+    FormatSize(sz, sizeof sz, size);
+    int sizeW = ShsMeasureText(sz, 13);
+    ShsDrawText(sz, (int)(x + w - sizeW), (int)cy - 7, 13, SHS_COLOR_TEXT_MUTED);
+
+    const bool busy = state == 0 || state == 5;
+    float nameW = w - 30 - sizeW - 16 - (busy ? 190.0f : 0.0f);
+    DrawPathFit(name, x + 30, cy - 8, 14, nameW, (state == 3 || state == 8) ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_TEXT_MAIN);
+
+    if (busy) {                                                   /* per-file progress */
+        float p = size ? (float)((double)done / (double)size) : 0.0f;
+        float bx = x + w - sizeW - 16 - 170.0f;
+        Rectangle track = { bx, cy - 4, 120, 8 };
+        ShsRoundRec(track, 1.0f, 8, SHS_COLOR_BG);
+        if (p > 0.0f) ShsRoundRec((Rectangle){ bx, cy - 4, fmaxf(8.0f, 120.0f * Clampf(p, 0, 1)), 8 }, 1.0f, 8, SHS_COLOR_PRIMARY);
+        char pct[12];
+        snprintf(pct, sizeof pct, "%d%%", (int)(Clampf(p, 0, 1) * 100.0f + 0.5f));
+        ShsDrawText(pct, (int)(bx + 128), (int)cy - 7, 13, SHS_COLOR_TEXT_MAIN);
+    }
+}
+
+static void DrawFilePanel(ShsTaskView *v, const ShsTask *t, Rectangle r, float baseH, float x, float w, bool inside, bool *pressedAny)
+{
+    const int id = (t->id >= 0 && t->id < SHS_TASK_VIEW_MAX) ? t->id : 0;
     float py = r.y + baseH;
     DrawRectangle((int)x, (int)py, (int)w, 1, Fade(SHS_COLOR_BORDER, 0.8f));
 
-    char head[SHS_TASK_PATH_MAX], sum[160];
+    char head[SHS_TASK_PATH_MAX], seg[4][64];
     snprintf(head, sizeof head, "%s", t->lastRun ? "LAST RUN" : "FILES");
     ShsDrawText(head, (int)x, (int)py + 12, 12, SHS_COLOR_TEXT_MUTED);
-    snprintf(sum, sizeof sum, "%llu of %llu copied  |  %llu removed  |  %llu error%s",
-             t->filesDone, t->filesTotal, t->filesRemoved, t->errors, t->errors == 1 ? "" : "s");
-    ShsDrawText(sum, (int)(x + w - ShsMeasureText(sum, 13)), (int)py + 11, 13,
-                t->errors ? SHS_COLOR_DANGER : SHS_COLOR_TEXT_MUTED);
+
+    /* summary: each part is a tab that lists those files (copied -> filter 2, removed -> 4, errors -> 3) */
+    snprintf(seg[0], sizeof seg[0], "%llu of %llu copied", t->filesDone, t->filesTotal);
+    snprintf(seg[1], sizeof seg[1], "%llu removed", t->filesRemoved);
+    snprintf(seg[2], sizeof seg[2], "%llu error%s", t->errors, t->errors == 1 ? "" : "s");
+    snprintf(seg[3], sizeof seg[3], "%llu temp file%s skipped", t->filesIgnored, t->filesIgnored == 1 ? "" : "s");
+    const bool tabs = t->rows != NULL;
+    float sx = x + w;
+    for (int k = 3; k >= 0; k--) {
+        int tw = ShsMeasureText(seg[k], 13);
+        sx -= (float)tw;
+        Rectangle tr = { sx - 6, py + 5, (float)tw + 12, 24 };
+        bool hot = tabs && inside && CheckCollisionPointRec(MousePos(v), tr);
+        bool sel = tabs && v->sumSel[id] == k + 1;
+        Color c = sel ? SHS_COLOR_PRIMARY : (k == 2 && t->errors ? SHS_COLOR_DANGER : (hot ? SHS_COLOR_TEXT_MAIN : SHS_COLOR_TEXT_MUTED));
+        ShsDrawText(seg[k], (int)sx, (int)py + 11, 13, c);
+        if (sel || hot) DrawRectangle((int)sx, (int)py + 27, tw, 2, sel ? SHS_COLOR_PRIMARY : Fade(c, 0.6f));
+        if (hot && Pressed(v)) { v->sumSel[id] = sel ? 0 : k + 1; v->sumTop[id] = 0.0f; *pressedAny = true; }
+        if (k > 0) { sx -= 12; ShsDrawText("|", (int)sx, (int)py + 11, 13, Fade(SHS_COLOR_TEXT_MUTED, 0.6f)); sx -= 12; }
+    }
 
     float ry = py + PANEL_HEAD;
+    const int sel = tabs ? v->sumSel[id] : 0;
+    if (sel > 0 && t->selRows > 0) {                              /* one of the lists: scrolls with the wheel */
+        static const int FILTER[4] = { 2, 4, 3, 5 };
+        const int rowsShown = t->selRows < SUM_ROWS_MAX ? t->selRows : SUM_ROWS_MAX;
+        Rectangle list = { x, ry, w, rowsShown * FILE_ROW_H };
+        ShsTaskRow rows[SUM_ROWS_MAX];
+        int total = 0;
+        t->rows(t->rowsCtx, FILTER[sel - 1], 0, 0, rows, &total);
+        if (inside && CheckCollisionPointRec(MousePos(v), list) && Pressed(v)) *pressedAny = true;     /* clicking a row must not collapse the card */
+        const bool scrollable = total > rowsShown;
+        float top = v->sumTop[id];
+        if (scrollable && inside && CheckCollisionPointRec(MousePos(v), list)) {
+            float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f) top -= wheel * 3.0f;
+            v->innerRect = list;
+        }
+        top = Clampf(top, 0.0f, (float)(scrollable ? total - rowsShown : 0));
+        v->sumTop[id] = top;
+        int n = total > 0 ? t->rows(t->rowsCtx, FILTER[sel - 1], (int)top, rowsShown, rows, &total) : 0;
+        if (total == 0 && ry + FILE_ROW_H <= r.y + r.height)
+            ShsDrawText("Nothing in this list.", (int)x, (int)ry + 5, 14, SHS_COLOR_TEXT_MUTED);
+        for (int k = 0; k < n; k++) {
+            float rowY = ry + k * FILE_ROW_H;
+            if (rowY + FILE_ROW_H > r.y + r.height - 2) break;
+            DrawFileRow(rows[k].name, rows[k].size, 0, rows[k].state, x, rowY, w, scrollable ? 12.0f : 0.0f);
+        }
+        if (scrollable) {
+            float th = fmaxf(24.0f, list.height * rowsShown / total);
+            float tyb = list.y + (list.height - th) * (top / (float)(total - rowsShown));
+            ShsRoundRec((Rectangle){ x + w - 6, list.y, 5, list.height }, 1.0f, 6, Fade(SHS_COLOR_BG, 0.8f));
+            ShsRoundRec((Rectangle){ x + w - 6, tyb, 5, th }, 1.0f, 6, SHS_COLOR_BORDER);
+        }
+        return;
+    }
+
     if (t->fileCount == 0) {
         if (ry + FILE_ROW_H <= r.y + r.height)
             ShsDrawText("No file activity yet. Start a sync to see files here.", (int)x, (int)ry + 5, 14, SHS_COLOR_TEXT_MUTED);
@@ -292,36 +479,7 @@ static void DrawFilePanel(const ShsTask *t, Rectangle r, float baseH, float x, f
     for (int i = 0; i < t->fileCount; i++, ry += FILE_ROW_H) {
         if (ry + FILE_ROW_H > r.y + r.height - 2) break;          /* still animating open */
         const ShsTaskFile *f = &t->files[i];
-        float cy = ry + FILE_ROW_H / 2;
-
-        Color col; ShsIcon ic;
-        switch (f->state) {
-            case 1:  col = SHS_COLOR_SUCCESS;    ic = SHS_ICON_CHECK;  break;
-            case 2:  col = SHS_COLOR_DANGER;     ic = SHS_ICON_WARN;   break;
-            case 3:  col = SHS_COLOR_TEXT_MUTED; ic = SHS_ICON_TRASH;  break;
-            case 4:  col = SHS_COLOR_TEXT_MUTED; ic = SHS_ICON_CLOSE;  break;       /* skipped */
-            default: col = SHS_COLOR_PRIMARY;    ic = SHS_ICON_SYNC;   break;
-        }
-        ShsDrawIcon(ic, x + 10, cy, 14.0f, col);
-
-        char size[24];
-        FormatSize(size, sizeof size, f->size);
-        int sizeW = ShsMeasureText(size, 13);
-        ShsDrawText(size, (int)(x + w - sizeW), (int)cy - 7, 13, SHS_COLOR_TEXT_MUTED);
-
-        float nameW = w - 30 - sizeW - 16 - (f->state == 0 || f->state == 5 ? 190.0f : 0.0f);
-        DrawTextFit(f->name, x + 30, cy - 8, 14, nameW, f->state == 3 ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_TEXT_MAIN, true);
-
-        if (f->state == 0 || f->state == 5) {                         /* per-file progress */
-            float p = f->size ? (float)((double)f->done / (double)f->size) : 0.0f;
-            float bx = x + w - sizeW - 16 - 170.0f;
-            Rectangle track = { bx, cy - 4, 120, 8 };
-            ShsRoundRec(track, 1.0f, 8, SHS_COLOR_BG);
-            if (p > 0.0f) ShsRoundRec((Rectangle){ bx, cy - 4, fmaxf(8.0f, 120.0f * Clampf(p, 0, 1)), 8 }, 1.0f, 8, SHS_COLOR_PRIMARY);
-            char pct[12];
-            snprintf(pct, sizeof pct, "%d%%", (int)(Clampf(p, 0, 1) * 100.0f + 0.5f));
-            ShsDrawText(pct, (int)(bx + 128), (int)cy - 7, 13, SHS_COLOR_TEXT_MAIN);
-        }
+        DrawFileRow(f->name, f->size, f->done, f->state, x, ry, w, 0.0f);
     }
 }
 
@@ -530,7 +688,7 @@ static ShsTaskAction DrawQuickPanel(ShsTaskView *v, const ShsTask *t, Rectangle 
             float right = x + w - (scrollable ? 14.0f : 4.0f);
             DrawRowState(f->state, right - 12, cy);
             RightText(a, right - 34, cy - 8, 14, SHS_COLOR_TEXT_MUTED);
-            DrawTextFit(f->name, x + 32, cy - 8, 14, right - 34 - 80 - (x + 32), f->state == 4 ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_TEXT_MAIN, true);
+            DrawPathFit(f->name, x + 32, cy - 8, 14, right - 34 - 80 - (x + 32), f->state == 4 ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_TEXT_MAIN);
         }
         if (total == 0) {
             const char *msg = filter == 0 ? "Drop files or folders here to copy them to the target"
@@ -623,7 +781,7 @@ static ShsTaskAction DrawQuickCard(ShsTaskView *view, int index, const ShsTask *
     if (t->curName[0]) {
         char full[SHS_TASK_PATH_MAX * 2];
         snprintf(full, sizeof full, "%s\\%s", t->source, t->curName);
-        DrawTextFit(full, textX, r.y + 17, 15, textMax, SHS_COLOR_TEXT_MAIN, true);
+        DrawPathFit(full, textX, r.y + 17, 15, textMax, SHS_COLOR_TEXT_MAIN);
     } else if (t->state == SHS_TASK_ERROR) {
         DrawTextFit(t->errorMsg[0] ? t->errorMsg : "Copy failed", textX, r.y + 17, 15, textMax, SHS_COLOR_DANGER, false);
     } else {
@@ -741,7 +899,7 @@ static ShsTaskAction DrawCard(ShsTaskView *view, int index, const ShsTask *t, Re
     /* buttons, right-aligned on the path row */
     CardButton b[6];
     int n = 0;
-    bool armed = view->armedRemove == index && GetTime() - view->armedAt < REMOVE_ARM_S;
+    const bool armed = false;                               /* removing is confirmed in the app's own dialog (it can also offer to delete the target files) */
     if (!t->quick)
         b[n++] = (CardButton){ {0}, SHS_ICON_WATCH, SHS_ACT_TOGGLE_AUTO,
                                t->autoSync ? "Auto-sync is on - click to turn off" : "Watch the source folder and sync automatically",
@@ -777,10 +935,6 @@ static ShsTaskAction DrawCard(ShsTaskView *view, int index, const ShsTask *t, Re
         if (IconButton(view, &b[i], &hovered, inside)) {
             act = b[i].act;
             *pressedAny = true;
-            if (act == SHS_ACT_REMOVE) {
-                if (armed) view->armedRemove = -1;                 /* confirmed */
-                else { view->armedRemove = index; view->armedAt = GetTime(); act = SHS_ACT_NONE; }
-            }
         }
     }
     if (hovered) DrawTooltip(hovered->tip, hovered->r, false, r.x + r.width - 4);
@@ -792,7 +946,7 @@ static ShsTaskAction DrawCard(ShsTaskView *view, int index, const ShsTask *t, Re
     int xid = (t->id >= 0 && t->id < SHS_TASK_VIEW_MAX) ? t->id : 0;
     ShsDrawIcon(view->expanded[xid] ? SHS_ICON_CHEVRON_UP : SHS_ICON_CHEVRON_DOWN, r.x + r.width / 2, r.y + baseH - 9, 14.0f,
                 Fade(SHS_COLOR_TEXT_MUTED, hover > 0.5f ? 1.0f : 0.55f));
-    if (view->expandT[xid] > 0.01f) DrawFilePanel(t, r, baseH, x, w);
+    if (view->expandT[xid] > 0.01f) DrawFilePanel(view, t, r, baseH, x, w, inside, pressedAny);
 
     /* footer */
     if (t->state == SHS_TASK_SYNCING) DrawFileLine(t, tx, r.y + 88, r.x + r.width - CARD_PAD - tx);
@@ -815,10 +969,12 @@ void ShsTaskViewRemoved(ShsTaskView *view, int id)
         view->expanded[k] = view->expanded[k + 1]; view->expandT[k] = view->expandT[k + 1];
         view->tab[k] = view->tab[k + 1]; view->filter[k] = view->filter[k + 1];
         view->listTop[k] = view->listTop[k + 1]; view->freeScroll[k] = view->freeScroll[k + 1];
+        view->sumSel[k] = view->sumSel[k + 1]; view->sumTop[k] = view->sumTop[k + 1];
     }
     const int last = SHS_TASK_VIEW_MAX - 1;
     view->expanded[last] = false; view->expandT[last] = 0.0f;
     view->tab[last] = 0; view->filter[last] = 0; view->listTop[last] = 0.0f; view->freeScroll[last] = false;
+    view->sumSel[last] = 0; view->sumTop[last] = 0.0f;
 }
 
 ShsTaskEvent ShsTaskListDraw(ShsTaskView *view, const ShsTask *tasks, int count, Rectangle bounds)

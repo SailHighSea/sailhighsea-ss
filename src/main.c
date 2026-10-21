@@ -6,6 +6,7 @@
 #include "engine/sync_engine.h"
 #include "engine/task_store.h"
 #include "platform/platform.h"
+#include "platform/updater.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -61,6 +62,11 @@ typedef struct {
     bool           pending;      /* a change was seen; sync once the folder has been quiet for a moment */
     double         lastChange;   /* when the last change was seen */
     double         nextWatchTry; /* retry time if the source folder could not be watched */
+    bool           usbSeen;      /* USB sync: the target's drive was connected at the last poll (valid once usbInit is set) */
+    bool           usbInit;
+    double         nextUsbPoll;
+    double         usbSyncAt;    /* USB sync: when to start after the drive appeared (0 = nothing waiting) */
+    char           runTarget[SHS_DEF_PATH_MAX];   /* the target the current / last run used (a USB task may have moved to another drive letter) */
     bool           failed;       /* last run ended with errors */
     char           resultMsg[SHS_TASK_MSG_MAX];
 
@@ -87,7 +93,12 @@ typedef struct {
     char name[SHS_DEF_NAME_MAX], src[SHS_DEF_PATH_MAX], dst[SHS_DEF_PATH_MAX];
     bool mirror;
     bool autoSync;
-    int  focus;                            /* 0 name, 1 source, 2 target */
+    bool usbSync;                          /* sync when the target's drive is connected */
+    bool usbMark;                          /* USB sync: write the hidden .simplesync-id file into the target to recognise this stick */
+    bool includeFolder;                    /* copy the source folder itself, not just its contents */
+    bool keepDeleted;                      /* mirror: move removed files to `del` instead of deleting them */
+    char del[SHS_DEF_PATH_MAX];
+    int  focus;                            /* 0 name, 1 source, 2 target, 3 deleted-files folder */
     bool drag;                             /* drag & drop zones instead of the folder text fields */
     bool quick;                            /* Quick Copy: one-off copy, nothing saved */
     char err[120];
@@ -101,6 +112,13 @@ static bool      g_quickVerify = false;      /* Quick Copy: verify copied files 
 static bool      g_quickUnattended = false;  /* Quick Copy: dismiss the card by itself when the copy finishes */
 static int       g_copyThreads = 4;          /* files copied in parallel (1..16) */
 static int       g_copyBufMiB = 64;          /* read-ahead buffer for small files, MiB (0 = off) */
+static bool      g_checkUpdates = false;     /* look for a newer release on GitHub at start-up and once a day */
+static bool      g_updateDev = false;        /* ...and also tell about dev (pre-release) builds */
+static double    g_nextUpdateCheck = 0;      /* GetTime() of the next automatic check */
+static bool      g_updateFound = false;      /* a newer release exists: shown in the status bar */
+static char      g_updateTag[64], g_updateUrl[256];
+static char      g_updateMsg[96];            /* result of the last check, shown in Settings */
+static float     g_setScroll = 0, g_setMax = 0;   /* Settings page scroll offset and the most it can scroll */
 static bool      g_hidden = false;           /* window currently hidden in the tray */
 static bool      g_launchedHidden = false;   /* started with --minimized */
 static bool      g_multi = false;            /* started with --multi (testing): must not touch the start-up entry */
@@ -336,7 +354,7 @@ static void DrawField(Rectangle r, const char *text, const char *placeholder, bo
 
 /* ---- persistence -------------------------------------------------------- */
 
-/* Settings file, one "key=value" per line: theme=auto|light|dark, startHidden=0|1, closeToTray=0|1, dragDialog=0|1, copyThreads=N, copyBufMB=N, quickVerify=0|1, quickUnattended=0|1.
+/* Settings file, one "key=value" per line: theme=auto|light|dark, startHidden=0|1, closeToTray=0|1, dragDialog=0|1, copyThreads=N, copyBufMB=N, quickVerify=0|1, quickUnattended=0|1, checkUpdates=0|1, updateDev=0|1.
    Whether the program starts with the system is read back from the OS, not stored here. */
 static void SaveSettings(void)
 {
@@ -345,9 +363,9 @@ static void SaveSettings(void)
     FILE *f = fopen(path, "wb");
     if (!f) return;
     ShsThemeMode m = ShsThemeGetMode();
-    fprintf(f, "theme=%s\nstartHidden=%d\ncloseToTray=%d\ndragDialog=%d\ncopyThreads=%d\ncopyBufMB=%d\nquickVerify=%d\nquickUnattended=%d\n",
+    fprintf(f, "theme=%s\nstartHidden=%d\ncloseToTray=%d\ndragDialog=%d\ncopyThreads=%d\ncopyBufMB=%d\nquickVerify=%d\nquickUnattended=%d\ncheckUpdates=%d\nupdateDev=%d\n",
             ShsThemeName(m), g_startHidden ? 1 : 0, g_closeToTray ? 1 : 0,
-            g_dragDialog ? 1 : 0, g_copyThreads, g_copyBufMiB, g_quickVerify ? 1 : 0, g_quickUnattended ? 1 : 0);
+            g_dragDialog ? 1 : 0, g_copyThreads, g_copyBufMiB, g_quickVerify ? 1 : 0, g_quickUnattended ? 1 : 0, g_checkUpdates ? 1 : 0, g_updateDev ? 1 : 0);
     fclose(f);
 }
 
@@ -368,6 +386,8 @@ static void LoadSettings(void)
         else if (strstr(line, "dragDialog=1"))    g_dragDialog = true;
         else if (strstr(line, "quickVerify=1"))     g_quickVerify = true;
         else if (strstr(line, "quickUnattended=1")) g_quickUnattended = true;
+        else if (strstr(line, "checkUpdates=1"))    g_checkUpdates = true;
+        else if (strstr(line, "updateDev=1"))       g_updateDev = true;
         else if (!strncmp(line, "copyThreads=", 12)) g_copyThreads = atoi(line + 12);
         else if (!strncmp(line, "copyBufMB=", 10))   g_copyBufMiB = atoi(line + 10);
     }
@@ -457,13 +477,91 @@ static void LoadTasks(void)
 
 /* ---- task control ------------------------------------------------------- */
 
-static const char *ValidateTask(const char *src, const char *dst)
+static const char *ValidateTask(const char *src, const char *dst, const char *deleted)
 {
     if (!src[0] || !dst[0])          return "Choose both a source and a target folder.";
     if (!DirectoryExists(src))       return "The source folder does not exist.";
     if (SameOrInside(src, dst))      return "Source and target overlap (source is inside the target).";
     if (SameOrInside(dst, src))      return "Source and target overlap (target is inside the source).";
+    if (deleted && deleted[0]) {
+        if (SameOrInside(deleted, src)) return "The deleted-files folder cannot be inside the source folder.";
+        if (SameOrInside(src, deleted)) return "The deleted-files folder cannot contain the source folder.";
+        if (SameOrInside(dst, deleted)) return "The deleted-files folder cannot contain the target folder.";
+    }
     return NULL;
+}
+
+/* `path` with the volume root `oldRoot` ("E:\" or "/media/me/STICK") swapped for `newRoot`. False when `path` is not on that volume. */
+static bool RemapVolume(const char *path, const char *oldRoot, const char *newRoot, char *out, size_t cap)
+{
+    size_t olen = oldRoot[1] == ':' ? 2 : strlen(oldRoot);                          /* "E:" ; "E:\Backup" -> "\Backup" */
+    while (olen > 1 && (oldRoot[olen - 1] == '/' || oldRoot[olen - 1] == '\\') && oldRoot[1] != ':') olen--;
+    if (strlen(path) < olen) return false;
+    for (size_t i = 0; i < olen; i++) {
+        char a = path[i], b = oldRoot[i];
+#ifdef _WIN32
+        a = (char)tolower((unsigned char)a); b = (char)tolower((unsigned char)b);
+#endif
+        if (a != b) return false;
+    }
+    const char *rest = path + olen;
+    if (*rest && *rest != '/' && *rest != '\\') return false;                      /* "E:x" or "/media/me/STICK2" is a different volume */
+    while (*rest == '\\' || *rest == '/') rest++;
+    size_t nl = strlen(newRoot);
+    bool sep = nl && (newRoot[nl - 1] == '\\' || newRoot[nl - 1] == '/');
+    snprintf(out, cap, "%s%s%s", newRoot, (sep || !*rest) ? "" : "/", rest);
+    return true;
+}
+
+/* A fresh 16-hex-digit id for a task's marker file. */
+static void NewUsbId(char *out, size_t cap)
+{
+    static unsigned long long counter = 0;
+    unsigned long long h = (unsigned long long)time(NULL) * 0x9E3779B97F4A7C15ull;
+    h ^= ((unsigned long long)clock() << 24) ^ (unsigned long long)(size_t)out ^ (++counter * 0xBF58476D1CE4E5B9ull);
+    h ^= (unsigned long long)GetRandomValue(0, 0x7fffffff) << 17;
+    h ^= h >> 31; h *= 0x94D049BB133111EBull; h ^= h >> 29;                       /* mix */
+    snprintf(out, cap, "%016llx", h);
+}
+
+/* Writes (or completes) the task's marker in `folder`, a target the sync used or the user picked. The id is created on first use.
+   Only done when the folder exists, so a missing drive never gets a folder made on it. */
+static bool UsbWriteMarker(ShsTaskDef *d, const char *folder)
+{
+    if (!d->usbSync || !d->usbMark || !folder[0] || !DirectoryExists(folder)) return false;
+    char id[sizeof d->usbId];
+    if (d->usbId[0]) snprintf(id, sizeof id, "%s", d->usbId); else NewUsbId(id, sizeof id);
+    if (!ShsMarkerAdd(folder, id)) return false;
+    snprintf(d->usbId, sizeof d->usbId, "%s", id);
+    return true;
+}
+
+/* USB sync: where the task's target and deleted-files folder are right now. Once the task has written its marker file
+   (.simplesync-id) into the target, the stick is recognised by that file: on the old drive letter if it is still there,
+   else on whichever connected drive has the same folder with the task's id in it. A different stick on the old letter has
+   no such file and is left alone. Returns false when the stick is not connected. */
+static bool UsbResolve(const ShsTaskDef *d, char *tgt, size_t tcap, char *del, size_t dcap)
+{
+    snprintf(tgt, tcap, "%s", d->target);
+    snprintf(del, dcap, "%s", d->deletedDir);
+    char root[SHS_DEF_PATH_MAX];
+    if (!ShsVolumeRoot(d->target, root, sizeof root)) return true;                 /* not on a drive that comes and goes */
+    const bool mounted = ShsVolumeMounted(root);
+    if (!d->usbMark || !d->usbId[0]) return mounted;                                              /* no marker yet: the drive path is all we know */
+    if (mounted && ShsMarkerHas(d->target, d->usbId)) return true;                 /* the right stick, where it was */
+
+    char vols[16][SHS_VOLUME_PATH], rootN[SHS_DEF_PATH_MAX], volN[SHS_DEF_PATH_MAX], cand[SHS_DEF_PATH_MAX];
+    NormPath(rootN, sizeof rootN, root);
+    int n = ShsListVolumes(vols, 16);
+    for (int k = 0; k < n; k++) {
+        NormPath(volN, sizeof volN, vols[k]);
+        if (!strcmp(volN, rootN)) continue;                                        /* the old place was checked above */
+        if (!RemapVolume(d->target, root, vols[k], cand, sizeof cand) || !ShsMarkerHas(cand, d->usbId)) continue;
+        snprintf(tgt, tcap, "%s", cand);                                           /* found: the same stick under another letter or mount point */
+        if (d->deletedDir[0]) RemapVolume(d->deletedDir, root, vols[k], del, dcap);   /* only changes it when it is on that stick */
+        return true;
+    }
+    return false;
 }
 
 /* Starts a task. For a Quick Copy, `item` (a dropped file or folder) is copied into the target instead of the source folder. */
@@ -471,7 +569,19 @@ static void StartTaskItem(int i, const char *item)
 {
     AppTask *a = &g_app[i];
     if (a->job) return;
-    const char *bad = item ? NULL : ValidateTask(a->def.source, a->def.target);
+    char tgtBuf[SHS_DEF_PATH_MAX], delBuf[SHS_DEF_PATH_MAX];
+    const char *tgt = a->def.target, *del = a->def.deletedDir;
+    if (!item && !a->quick && a->def.usbSync) {                       /* USB sync: the stick must be there, and be the right one */
+        if (!UsbResolve(&a->def, tgtBuf, sizeof tgtBuf, delBuf, sizeof delBuf)) {
+            a->failed = true;
+            snprintf(a->resultMsg, sizeof a->resultMsg, "The USB drive for this task is not connected.");
+            LogAdd("%s: %s", a->def.name, a->resultMsg);
+            return;
+        }
+        if (strcmp(tgtBuf, a->def.target)) LogAdd("%s: the USB drive is now %s", a->def.name, tgtBuf);
+        tgt = tgtBuf; del = delBuf;
+    }
+    const char *bad = item ? NULL : ValidateTask(a->def.source, tgt, a->def.mirror ? del : NULL);
     if (item && SameOrInside(a->def.target, item)) bad = "The target is inside the dropped folder.";
     if (bad) {
         a->failed = true;
@@ -480,9 +590,10 @@ static void StartTaskItem(int i, const char *item)
         return;
     }
     if (a->doneJob) { ShsSyncFree(a->doneJob); a->doneJob = NULL; }
+    snprintf(a->runTarget, sizeof a->runTarget, "%s", tgt);
     if (item)          a->job = ShsSyncStartItem(item, a->def.target, SHS_CONFLICT_ASK);
     else if (a->quick) a->job = ShsSyncStartItem(a->def.source, a->def.target, SHS_CONFLICT_ASK);   /* the folder itself lands in the target, like dropped folders */
-    else               a->job = ShsSyncStart(a->def.source, a->def.target, a->def.mirror);
+    else               a->job = ShsSyncStartEx(a->def.source, tgt, a->def.mirror, del, a->def.includeFolder);
     if (!a->job) {
         a->failed = true;
         snprintf(a->resultMsg, sizeof a->resultMsg, "Could not start the sync thread.");
@@ -498,7 +609,8 @@ static void StartTaskItem(int i, const char *item)
         ShsSyncSetVerify(a->job, a->quickVerify);
         TaskLog(a, "Copy started: %s -> %s", item ? item : a->def.source, a->def.target);
     } else {
-        LogAdd("%s: sync started%s", a->def.name, a->def.mirror ? " (mirror)" : "");
+        LogAdd("%s: sync started%s%s", a->def.name, a->def.mirror ? " (mirror)" : "",
+               a->def.mirror && a->def.deletedDir[0] ? ", removed files go to the deleted-files folder" : "");
     }
 }
 
@@ -527,14 +639,16 @@ static int QueryRows(void *ctx, int filter, int first, int max, ShsTaskRow *out,
     ShsSyncJob *j = a->job ? a->job : a->doneJob;
     *total = 0;
     if (!j) return 0;
-    static const unsigned MASK[4] = {
-        ~0u,
+    static const unsigned MASK[6] = {
+        ~(1u << SHS_FILE_IGNORED),                  /* "all" leaves out the temp files that were never part of the copy */
         (1u << SHS_FILE_PENDING) | (1u << SHS_FILE_COPYING) | (1u << SHS_FILE_VERIFYING),
         1u << SHS_FILE_DONE,
-        (1u << SHS_FILE_FAILED) | (1u << SHS_FILE_SKIPPED) };
+        (1u << SHS_FILE_FAILED) | (1u << SHS_FILE_SKIPPED),
+        1u << SHS_FILE_REMOVED,
+        1u << SHS_FILE_IGNORED };
     static ShsSyncFileRow tmp[16];
     if (max > 16) max = 16;
-    int n = ShsSyncGetFiles(j, MASK[filter & 3], first, max, tmp, total);
+    int n = ShsSyncGetFiles(j, MASK[filter >= 0 && filter < 6 ? filter : 0], first, max, tmp, total);
     for (int k = 0; k < n; k++) {
         snprintf(out[k].name, sizeof out[k].name, "%s", tmp[k].name);
         out[k].size = tmp[k].size;
@@ -548,7 +662,7 @@ static void FinishTask(int i)
     AppTask *a = &g_app[i];
     ShsSyncStatus s;
     ShsSyncGetStatus(a->job, &s);
-    if (a->quick) a->doneJob = a->job;               /* keep it: the card's file list reads from it */
+    if (a->quick || ShsSyncFileCount(a->job) <= 100000) a->doneJob = a->job;   /* keep it: the card's file lists (copied / removed / errors) read from it; a huge run is not worth the memory */
     else          ShsSyncFree(a->job);
     a->job = NULL;
     a->endTime = GetTime();
@@ -560,6 +674,8 @@ static void FinishTask(int i)
     if (s.state == SHS_SYNC_DONE) {
         a->def.lastSync = (long long)time(NULL);
         a->def.lastBytes = (long long)s.bytesDone;
+        if (a->def.usbSync && !a->quick && !a->def.usbId[0] && !UsbWriteMarker(&a->def, a->runTarget))   /* first good run: mark the stick */
+            LogAdd("%s: could not write the .simplesync-id marker into %s", a->def.name, a->runTarget);
         a->failed = false;
         LogAdd("%s: done - %llu file(s) copied, %llu removed", a->def.name,
                (unsigned long long)s.filesDone, (unsigned long long)s.filesDeleted);
@@ -631,6 +747,70 @@ static void WatchTasks(void)
     }
 }
 
+/* USB sync: when the drive that holds a task's target gets connected, sync once after it has had a moment to settle.
+   A drive that is already connected when the app starts does not trigger anything; only a new connection does. */
+#define USB_POLL_S    2.0
+#define USB_SETTLE_S  3.0
+static void UsbTasks(void)
+{
+    double now = GetTime();
+    for (int i = 0; i < g_count; i++) {
+        AppTask *a = &g_app[i];
+        if (a->quick || !a->def.usbSync) { a->usbInit = false; a->usbSyncAt = 0; continue; }
+        if (now >= a->nextUsbPoll) {
+            a->nextUsbPoll = now + USB_POLL_S;
+            char tgt[SHS_DEF_PATH_MAX], del[SHS_DEF_PATH_MAX];
+            bool present = UsbResolve(&a->def, tgt, sizeof tgt, del, sizeof del);       /* the right stick, even under a new drive letter */
+            if (a->usbInit && present && !a->usbSeen) {
+                a->usbSyncAt = now + USB_SETTLE_S;
+                LogAdd("%s: USB drive %s connected", a->def.name, tgt);
+            }
+            if (!present) a->usbSyncAt = 0;                        /* unplugged again before the sync started */
+            a->usbSeen = present;
+            a->usbInit = true;
+        }
+        if (a->usbSyncAt && now >= a->usbSyncAt && !a->job) {
+            a->usbSyncAt = 0;
+            LogAdd("%s: syncing because the drive was connected", a->def.name);
+            StartTask(i);
+        }
+    }
+}
+
+/* Update check: once shortly after start-up and then daily while the option is on; the result shows in the status bar. */
+#define UPDATE_FIRST_S   8.0
+#define UPDATE_EVERY_S   86400.0
+static void UpdateCheckNow(bool manual)
+{
+    if (ShsUpdateCheckStart(g_updateDev)) { if (manual) snprintf(g_updateMsg, sizeof g_updateMsg, "Checking..."); }
+}
+
+static void UpdateTick(void)
+{
+    double now = GetTime();
+    if (g_checkUpdates && now >= g_nextUpdateCheck && now >= UPDATE_FIRST_S) {
+        g_nextUpdateCheck = now + UPDATE_EVERY_S;
+        UpdateCheckNow(false);
+    }
+    char tag[64], url[256];
+    int r = ShsUpdateCheckPoll(tag, sizeof tag, url, sizeof url);
+    if (r == 1) {
+        if (g_updateDev ? ShsVersionNewer(tag, SHS_VERSION) : ShsVersionCoreNewer(tag, SHS_VERSION)) {
+            bool fresh = !g_updateFound || strcmp(g_updateTag, tag);
+            g_updateFound = true;
+            snprintf(g_updateTag, sizeof g_updateTag, "%s", tag);
+            snprintf(g_updateUrl, sizeof g_updateUrl, "%s", url);
+            snprintf(g_updateMsg, sizeof g_updateMsg, "Version %s is available", tag);
+            if (fresh) LogAdd("Update available: %s (you have %s)", tag, SHS_VERSION);
+        } else {
+            g_updateFound = false;
+            snprintf(g_updateMsg, sizeof g_updateMsg, "You are up to date (latest release: %s)", tag);
+        }
+    } else if (r == -1) {
+        snprintf(g_updateMsg, sizeof g_updateMsg, "Could not check for updates (offline, or no release yet)");
+    }
+}
+
 static void RemoveTask(int i)
 {
     StopWatch(i);
@@ -655,6 +835,8 @@ static void BuildView(const AppTask *a, ShsTask *v)
     v->mirror = a->def.mirror;
     v->autoSync = a->def.autoSync;
     v->quick = a->quick;
+    v->rows = QueryRows;                                              /* file lists: Quick Copy panel, and the copied / removed / errors tabs of a sync card */
+    v->rowsCtx = (void *)a;
 
     if (a->quick) {                                                   /* Quick Copy expanded panel data */
         v->rows = QueryRows;
@@ -692,7 +874,7 @@ static void BuildView(const AppTask *a, ShsTask *v)
             if (fs->recent[k].state == SHS_FILE_COPYING || fs->recent[k].state == SHS_FILE_VERIFYING) v->activeFiles++;
         if (v->elapsedSec > 1.0f) v->avgMBps = (float)((double)fs->bytesDone / 1048576.0 / v->elapsedSec);
         v->filesDone = fs->filesDone; v->filesTotal = fs->filesTotal;
-        v->filesRemoved = fs->filesDeleted; v->errors = fs->errorCount;
+        v->filesRemoved = fs->filesDeleted; v->errors = fs->errorCount; v->filesIgnored = fs->filesIgnored;
         v->fileCount = fs->recentCount < SHS_TASK_FILES ? fs->recentCount : SHS_TASK_FILES;
         for (int k = 0; k < v->fileCount; k++) {
             snprintf(v->files[k].name, sizeof v->files[k].name, "%s", fs->recent[k].name);
@@ -722,7 +904,7 @@ static void BuildView(const AppTask *a, ShsTask *v)
         return;
     }
 
-    char meta[96];
+    char meta[160];
     snprintf(meta, sizeof meta, "%s", a->quick ? "Quick copy - not copied yet" : "Never synced");
     if (a->def.lastSync) {
         char ago[24], sz[24];
@@ -731,7 +913,9 @@ static void BuildView(const AppTask *a, ShsTask *v)
         snprintf(meta, sizeof meta, "%s: %s | %s", a->quick ? "Quick copy done" : "Last synced", ago, sz);
     }
     if (a->def.mirror) strncat(meta, " | Mirror", sizeof meta - strlen(meta) - 1);
+    if (a->def.mirror && a->def.deletedDir[0]) strncat(meta, " (keeps deleted files)", sizeof meta - strlen(meta) - 1);
     if (a->def.autoSync) strncat(meta, " | Auto-sync", sizeof meta - strlen(meta) - 1);
+    if (a->def.usbSync) strncat(meta, " | USB sync", sizeof meta - strlen(meta) - 1);
     snprintf(v->meta, sizeof v->meta, "%s", meta);
 
     if (a->failed) {
@@ -764,12 +948,23 @@ static void CreateSandbox(void)
 
 static const char *LastFolder(const char *path);
 
+/* Suggested folder for removed files: <target><source folder name>-deleted, so it sits on the target drive next to the copied folder. */
+static void SuggestDeletedDir(const char *src, const char *dst, char *out, size_t cap)
+{
+    char name[SHS_DEF_NAME_MAX * 2];
+    snprintf(name, sizeof name, "%s", src[0] ? LastFolder(src) : "removed");
+    size_t n = strlen(dst);
+    bool ends = n && (dst[n - 1] == '\\' || dst[n - 1] == '/');                 /* a drive root "E:\" already has its separator */
+    snprintf(out, cap, "%s%s%s-deleted", dst, ends ? "" : (strchr(dst, '\\') ? "\\" : "/"), name);
+}
+
 static void DialogOpen(Dialog *d, int editIdx)
 {
     memset(d, 0, sizeof *d);
     d->open = true;
     d->editIdx = editIdx;
     d->drag = g_dragDialog;
+    d->usbMark = true;                     /* a new USB task marks its stick unless told not to (an edited one overrides this below) */
     if (editIdx >= 0) {
         const ShsTaskDef *t = &g_app[editIdx].def;
         snprintf(d->name, sizeof d->name, "%s", t->name);
@@ -777,6 +972,11 @@ static void DialogOpen(Dialog *d, int editIdx)
         snprintf(d->dst, sizeof d->dst, "%s", t->target);
         d->mirror = t->mirror;
         d->autoSync = t->autoSync;
+        d->usbSync = t->usbSync;
+        d->usbMark = t->usbMark;
+        d->includeFolder = t->includeFolder;
+        d->keepDeleted = t->deletedDir[0] != 0;
+        snprintf(d->del, sizeof d->del, "%s", t->deletedDir);
     }
 }
 
@@ -804,7 +1004,7 @@ static void StartQuickCopy(const char *src, const char *dst)
 
 static void DialogSubmit(Dialog *d)
 {
-    const char *bad = ValidateTask(d->src, d->dst);
+    const char *bad = ValidateTask(d->src, d->dst, d->mirror && d->keepDeleted ? d->del : NULL);
     if (bad) { snprintf(d->err, sizeof d->err, "%s", bad); return; }
 
     if (d->quick) {                                  /* Quick Copy: a temporary card, copy only (no deletions), nothing saved */
@@ -827,9 +1027,22 @@ static void DialogSubmit(Dialog *d)
     snprintf(fallback, sizeof fallback, "Task %d", g_count);
     snprintf(a->def.name, sizeof a->def.name, "%s", d->name[0] ? d->name : fallback);
     snprintf(a->def.source, sizeof a->def.source, "%s", d->src);
+    const bool sameTarget = d->editIdx >= 0 && !strcmp(a->def.target, d->dst);          /* editing without changing the target */
+    if (d->editIdx >= 0 && a->def.usbId[0] && (!d->usbSync || !d->usbMark)) {          /* the ID file is no longer wanted: take this task out of it */
+        char otgt[SHS_DEF_PATH_MAX], odel[SHS_DEF_PATH_MAX];
+        if (UsbResolve(&a->def, otgt, sizeof otgt, odel, sizeof odel)) ShsMarkerRemove(otgt, a->def.usbId);
+    }
     snprintf(a->def.target, sizeof a->def.target, "%s", d->dst);
     a->def.mirror = d->mirror;
     a->def.autoSync = d->autoSync;
+    a->def.usbSync = d->usbSync;
+    a->def.usbMark = d->usbMark;
+    if (!d->usbSync || !d->usbMark) a->def.usbId[0] = 0;
+    else if (!(sameTarget && a->def.usbId[0]) && !UsbWriteMarker(&a->def, d->dst))     /* a new target: the user picked this stick, so mark it */
+        a->def.usbId[0] = 0;                                                           /* ...folder not there yet: the first good sync marks it */
+    a->def.includeFolder = d->includeFolder;
+    snprintf(a->def.deletedDir, sizeof a->def.deletedDir, "%s", d->mirror && d->keepDeleted ? d->del : "");
+    a->usbInit = false;                          /* start watching the drive again from its current state */
     StopWatch((int)(a - g_app));                 /* restart the watcher on the (possibly new) source folder */
     a->failed = false;
     LogAdd("%s: %s", a->def.name, d->editIdx >= 0 ? "updated" : "added");
@@ -923,7 +1136,7 @@ static int DropZone(Rectangle r, const char *label, const char *path, const char
     bool filled = path[0] != 0;
     Color edge = hot ? SHS_COLOR_PRIMARY : (filled ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_BORDER);
     FillRound(r, 12.0f, hot ? Fade(SHS_COLOR_PRIMARY, 0.10f) : SHS_COLOR_BG);
-    DashedRoundRect((Rectangle){ r.x + 0.7f, r.y + 0.7f, r.width - 1.4f, r.height - 1.4f }, 11.3f, edge);
+    DashedRoundRect((Rectangle){ r.x + 0.7f, r.y + 0.7f, r.width - 1.4f, r.height - 1.4f }, ShsThemeFlat() ? 0.0f : 11.3f, edge);   /* square corners in the square themes */
     ShsDrawText(label, (int)r.x + 14, (int)r.y + 10, 12, SHS_COLOR_TEXT_MUTED);
 
     Rectangle clr = { r.x + r.width - 32, r.y + 6, 24, 24 };
@@ -1100,12 +1313,129 @@ static void ConflictDraw(int ti, int W, int H)
     }
 }
 
+/* ---- delete task dialog ------------------------------------------------------------------------------------------- */
+
+typedef struct { bool open; int idx; bool purge; char err[200]; } DeleteDialog;
+static DeleteDialog g_del;                 /* asks before a task is removed, and whether its synced files go too (never ticked by default) */
+static ShsPurgeJob *g_purge = NULL;        /* background deletion of a removed task's target files (one at a time) */
+static char         g_purgeName[SHS_DEF_NAME_MAX];
+
+/* Where the confirmed deletion would work: the task's target folder, found again on its USB stick if needed. */
+static bool DeleteTargetOf(const AppTask *a, char *tgt, size_t cap)
+{
+    char del[SHS_DEF_PATH_MAX];
+    if (a->def.usbSync) return UsbResolve(&a->def, tgt, cap, del, sizeof del);
+    snprintf(tgt, cap, "%s", a->def.target);
+    return true;
+}
+
+/* Called when "Delete" is pressed. Returns true when the task may be removed now; otherwise g_del.err says why not. */
+static bool DeleteConfirm(void)
+{
+    AppTask *a = &g_app[g_del.idx];
+    g_del.err[0] = 0;
+    char tgt[SHS_DEF_PATH_MAX];
+    const bool have = DeleteTargetOf(a, tgt, sizeof tgt);
+    if (g_del.purge) {
+        if (g_purge) { snprintf(g_del.err, sizeof g_del.err, "Another deletion is still running. Wait for it to finish."); return false; }
+        if (!have) {
+            snprintf(g_del.err, sizeof g_del.err, "The USB drive is not connected, so its files cannot be deleted. Plug it in, or untick the option.");
+            return false;
+        }
+        if (DirectoryExists(tgt)) {
+            g_purge = ShsPurgeStart(a->def.source, tgt, a->def.includeFolder);
+            if (!g_purge) { snprintf(g_del.err, sizeof g_del.err, "Could not start deleting the files."); return false; }
+            snprintf(g_purgeName, sizeof g_purgeName, "%s", a->def.name);
+            LogAdd("%s: deleting its synced files from %s", a->def.name, tgt);
+        } else {
+            LogAdd("%s: the target folder %s does not exist, no files to delete", a->def.name, tgt);
+        }
+    }
+    if (a->def.usbSync && a->def.usbId[0] && have && ShsMarkerRemove(tgt, a->def.usbId)) LogAdd("%s: marker removed from %s", a->def.name, tgt);
+    return true;
+}
+
+/* Result of the background deletion, once it has finished. */
+static void PurgeTick(void)
+{
+    unsigned long long deleted = 0, failed = 0;
+    if (!g_purge || !ShsPurgeStatus(g_purge, &deleted, &failed)) return;
+    LogAdd("%s: deleted %llu file(s) from the target%s", g_purgeName, deleted, failed ? ", some could not be deleted" : "");
+    if (failed) LogAdd("%s: %llu file(s) could not be deleted (in use, or no permission)", g_purgeName, failed);
+    ShsPurgeFree(g_purge);
+    g_purge = NULL;
+}
+
+/* Returns 0 while open, 1 cancelled, 2 "Delete" pressed (the caller runs DeleteConfirm and removes the task). */
+static int DeleteDraw(int W, int H)
+{
+    g_block = false;
+    FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
+    const AppTask *a = &g_app[g_del.idx];
+
+    const float pw = 620, ph = g_del.purge ? 372.0f : 250.0f;
+    Rectangle p = { (float)((W - pw) / 2), (float)((H - ph) / 2), pw, ph };
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
+    const float x = p.x + 24, w = pw - 48;
+    char fit[SHS_DEF_PATH_MAX + 64], line[SHS_DEF_PATH_MAX + 128];
+
+    ShsDrawText("Delete task", (int)x, (int)p.y + 20, 22, SHS_COLOR_TEXT_MAIN);
+    snprintf(line, sizeof line, "Delete the task \"%s\"?", a->def.name);
+    ShsDrawText(FitTail(fit, sizeof fit, line, 16, w), (int)x, (int)p.y + 62, 16, SHS_COLOR_TEXT_MAIN);
+    ShsDrawText("The task is removed from SimpleSync. Your source folder is not touched.", (int)x, (int)p.y + 90, 14, SHS_COLOR_TEXT_MUTED);
+
+    DialogCheck(x, p.y + 122, w, "Also delete the files this task synced to the target", &g_del.purge);
+    float y = p.y + 166;
+    if (g_del.purge) {
+        char tgt[SHS_DEF_PATH_MAX];
+        const bool have = DeleteTargetOf(a, tgt, sizeof tgt);
+        if (a->def.includeFolder) {
+            char name[SHS_DEF_NAME_MAX * 2];
+            snprintf(name, sizeof name, "%s", LastFolder(a->def.source));
+            snprintf(line, sizeof line, "Permanently deletes the folder \"%s%s%s\" and everything in it.", tgt, strchr(tgt, '\\') ? "\\" : "/", name);
+        } else {
+            snprintf(line, sizeof line, "Permanently deletes the files in \"%s\" that also exist in the source folder. Other files stay.", tgt);
+        }
+        ShsDrawIcon(SHS_ICON_WARN, x + 10, y + 12, 18.0f, SHS_COLOR_DANGER);
+        ShsDrawText(FitTail(fit, sizeof fit, line, 14, w - 34), (int)x + 30, (int)y + 4, 14, SHS_COLOR_DANGER);
+        ShsDrawText("This cannot be undone, and the files do not go to the Recycle Bin.", (int)x + 30, (int)y + 28, 14, SHS_COLOR_DANGER);
+        ShsDrawText(have ? "Files that are open in another program may not be deleted." : "The USB drive is not connected right now.", (int)x + 30, (int)y + 52, 14, SHS_COLOR_TEXT_MUTED);
+        y += 84;
+    }
+    if (g_del.err[0]) ShsDrawText(FitTail(fit, sizeof fit, g_del.err, 14, w), (int)x, (int)y + 2, 14, SHS_COLOR_DANGER);
+
+    Rectangle ok = { p.x + pw - 24 - (g_del.purge ? 210.0f : 150.0f), p.y + ph - 56, g_del.purge ? 210.0f : 150.0f, 36 };
+    Rectangle cancel = { ok.x - 118, ok.y, 110, 36 };
+    int result = 0;
+    if (ButtonI(cancel, "Cancel", SHS_ICON_CLOSE, false, false)) result = 1;
+    if (g_del.purge) {                                                    /* the destructive choice looks like one */
+        bool hot = CheckCollisionPointRec(Mouse(), ok);
+        ShsDrawButtonBox(ok, 8.0f, hot ? Fade(SHS_COLOR_DANGER, 0.85f) : SHS_COLOR_DANGER, SHS_COLOR_DANGER, hot && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        const char *lb = "Delete task and files";
+        ShsDrawText(lb, (int)(ok.x + (ok.width - ShsMeasureText(lb, 15)) / 2), (int)ok.y + 9, 15, SHS_COLOR_ON_PRIMARY);
+        if (hot && Pressed()) result = 2;
+    } else if (ButtonI(ok, "Delete task", SHS_ICON_TRASH, true, false)) {
+        result = 2;
+    }
+    if (IsKeyPressed(KEY_ESCAPE)) result = 1;
+    if (!g_del.purge && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))) result = 2;   /* Enter never confirms a file deletion */
+    return result;
+}
+
 static void DialogDraw(Dialog *d, int W, int H)
 {
     g_block = false;
     FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
 
-    const float pw = 640, ph = d->quick ? 372 : 428;
+    const bool showDel = !d->quick && d->mirror && d->keepDeleted;     /* the deleted-files folder row */
+    const bool showMark = !d->quick && d->usbSync;                     /* the ID file option, with its explanation */
+    /* option rows, as y offsets under the fields; each one is 32 px, the ID file option has a 36 px explanation under it */
+    const float oUsb = 196 + 3 * 32.0f, oMark = oUsb + 32;
+    const float oKeep = oMark + (showMark ? 32 + 36 : 0);
+    const float oDel = oKeep + 32;
+    const float rowsEnd = (d->mirror ? oKeep + 32 + (showDel ? 44 : 0) : oKeep);   /* y offset below the last option row */
+    const float pw = 640, ph = d->quick ? 372 : rowsEnd + 124;
     Rectangle p = { (W - pw) / 2, (H - ph) / 2, pw, ph };
     if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
     else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
@@ -1145,16 +1475,23 @@ static void DialogDraw(Dialog *d, int W, int H)
     } else {
         ShsDrawText("NAME (optional)", (int)x, (int)y + 2, 12, SHS_COLOR_TEXT_MUTED);
     }
-    char *bufs[3] = { d->name, d->src, d->dst };
-    const size_t caps[3] = { sizeof d->name, sizeof d->src, sizeof d->dst };
-    Rectangle fields[3] = { fName, fSrc, fDst };
-    const char *hint[3] = { "e.g. Photos backup", "Folder to copy from", "Folder to copy to" };
+    Rectangle fDel = { x, y + oDel, w - 100, 34 };
+    Rectangle bDel = { x + w - 90, y + oDel, 90, 34 };
+    char *bufs[4] = { d->name, d->src, d->dst, d->del };
+    const size_t caps[4] = { sizeof d->name, sizeof d->src, sizeof d->dst, sizeof d->del };
+    Rectangle fields[4] = { fName, fSrc, fDst, fDel };
+    const char *hint[4] = { "e.g. Photos backup", "Folder to copy from", "Folder to copy to", "Folder for files removed from the source" };
+    const int nFields = showDel ? 4 : 3;
 
     if (d->drag) {
-        d->focus = 0;
+        if (d->focus != 3 || !showDel) d->focus = 0;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !d->quick) {
+            if (CheckCollisionPointRec(GetMousePosition(), fName)) d->focus = 0;
+            else if (showDel && CheckCollisionPointRec(GetMousePosition(), fDel)) d->focus = 3;
+        }
         if (!d->quick) {
-            HandleTyping(d->name, sizeof d->name);
-            DrawField(fName, d->name, hint[0], true, SHS_ICON_NONE);
+            if (d->focus == 0) HandleTyping(d->name, sizeof d->name);
+            DrawField(fName, d->name, hint[0], d->focus == 0, SHS_ICON_NONE);
         }
 
         int a = DropZone(zSrc, "SOURCE FOLDER", d->src, "source");
@@ -1169,12 +1506,13 @@ static void DialogDraw(Dialog *d, int W, int H)
         ShsDrawText("TARGET FOLDER", (int)x, (int)y + 126, 12, SHS_COLOR_TEXT_MUTED);
 
         const int first = d->quick ? 1 : 0;                  /* Quick Copy has no name field */
+        if (d->focus >= nFields) d->focus = 0;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-            for (int i = first; i < 3; i++) if (CheckCollisionPointRec(GetMousePosition(), fields[i])) d->focus = i;
-        if (IsKeyPressed(KEY_TAB)) d->focus = (d->focus + ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 2 : 1)) % 3;
+            for (int i = first; i < nFields; i++) if (CheckCollisionPointRec(GetMousePosition(), fields[i])) d->focus = i;
+        if (IsKeyPressed(KEY_TAB)) d->focus = (d->focus + ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? nFields - 1 : 1)) % nFields;
         if (d->focus < first) d->focus = first;
         HandleTyping(bufs[d->focus], caps[d->focus]);
-        for (int i = first; i < 3; i++) DrawField(fields[i], bufs[i], hint[i], d->focus == i, SHS_ICON_NONE);
+        for (int i = first; i < nFields; i++) DrawField(fields[i], bufs[i], hint[i], d->focus == i, SHS_ICON_NONE);
 
         if (ButtonI(bSrc, "Browse", SHS_ICON_FOLDER, false, false)) {
             char pick[SHS_DEF_PATH_MAX];
@@ -1187,11 +1525,36 @@ static void DialogDraw(Dialog *d, int W, int H)
     }
 
     if (!d->quick) {
-        DialogCheck(x, y + 196, w, "Mirror: delete files in the target that are not in the source", &d->mirror);
-        DialogCheck(x, y + 232, w, "Auto-sync: watch the source folder and sync changes automatically", &d->autoSync);
+        char incl[200];
+        if (d->src[0]) snprintf(incl, sizeof incl, "Include the folder itself: files go to \"%s\" inside the target", LastFolder(d->src));
+        else           snprintf(incl, sizeof incl, "Include the folder itself, not only the files inside it");
+        DialogCheck(x, y + 196, w, incl, &d->includeFolder);
+        DialogCheck(x, y + 196 + 32, w, "Mirror: delete files in the target that are not in the source", &d->mirror);
+        DialogCheck(x, y + 196 + 64, w, "Auto-sync: watch the source folder and sync changes automatically", &d->autoSync);
+        DialogCheck(x, y + oUsb, w, "USB sync: sync when the target drive is plugged in", &d->usbSync);
+        if (showMark) {                                                  /* only meaningful for a USB task */
+            DialogCheck(x + 28, y + oMark, w - 28, "Mark the USB drive with a hidden ID file (.simplesync-id)", &d->usbMark);
+            ShsDrawText("A small hidden file in the target folder says which stick this is,",
+                        (int)x + 60, (int)(y + oMark + 30), 13, SHS_COLOR_TEXT_MUTED);
+            ShsDrawText(d->usbMark ? "so it is found under any drive letter and other sticks are never used."
+                                   : "Off: nothing is written; any drive with the same letter is used.",
+                        (int)x + 60, (int)(y + oMark + 47), 13, d->usbMark ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_WARNING);
+        }
+        if (d->mirror) {
+            bool was = d->keepDeleted;
+            DialogCheck(x, y + oKeep, w, "Keep removed files: move them to a folder instead of deleting", &d->keepDeleted);
+            if (d->keepDeleted && !was && !d->del[0] && d->dst[0])      /* suggest a folder on the target drive */
+                SuggestDeletedDir(d->src, d->dst, d->del, sizeof d->del);
+            if (d->keepDeleted && !was) d->focus = 3;
+        }
+        if (showDel && ButtonI(bDel, "Browse", SHS_ICON_FOLDER, false, false)) {
+            char pick[SHS_DEF_PATH_MAX];
+            if (ShsPickFolder("Select the folder for removed files", pick, sizeof pick)) snprintf(d->del, sizeof d->del, "%s", pick);
+        }
+        if (showDel && d->drag) DrawField(fDel, d->del, hint[3], d->focus == 3, SHS_ICON_NONE);
     }
 
-    if (d->err[0]) ShsDrawText(d->err, (int)x, (int)y + (d->quick ? 204 : 276), 15, SHS_COLOR_DANGER);
+    if (d->err[0]) ShsDrawText(d->err, (int)x, (int)y + (d->quick ? 204 : (int)rowsEnd), 15, SHS_COLOR_DANGER);
 
     Rectangle save = { p.x + pw - 24 - 110, p.y + ph - 56, 110, 36 };
     Rectangle cancel = { save.x - 118, save.y, 110, 36 };
@@ -1280,7 +1643,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--dev")) CreateSandbox();
         if (!strcmp(argv[i], "--minimized")) g_launchedHidden = true;
         if (!strcmp(argv[i], "--quick") && i + 2 < argc && g_count < MAX_TASKS) {      /* --quick <source> <target>: start a Quick Copy */
-            if (!ValidateTask(argv[i + 1], argv[i + 2])) StartQuickCopy(argv[i + 1], argv[i + 2]);
+            if (!ValidateTask(argv[i + 1], argv[i + 2], NULL)) StartQuickCopy(argv[i + 1], argv[i + 2]);
             i += 2;
         }
         if (!strcmp(argv[i], "--quick-add") && i + 1 < argc && g_count > 0 && g_app[g_count - 1].quick) {   /* dev: same as dropping a path on the card */
@@ -1347,7 +1710,7 @@ int main(int argc, char **argv)
         int conflictTask = -1;                                /* a Quick Copy waiting for "overwrite / skip / keep both" */
         for (int i = 0; i < g_count; i++) if (g_app[i].job && g_app[i].last.conflictPending) { conflictTask = i; break; }
         if (conflictTask >= 0 && g_hidden) ShowFromTray();
-        g_block = dlg.open || conflictTask >= 0;
+        g_block = dlg.open || conflictTask >= 0 || g_del.open;
         Vector2 mouse = Mouse();
         bool maximized = IsWindowMaximized();
 
@@ -1376,6 +1739,9 @@ int main(int argc, char **argv)
         ShsFontsCheckDpi();
         PollJobs();
         WatchTasks();
+        UsbTasks();
+        UpdateTick();
+        PurgeTick();
         for (int i = 0; i < g_count; i++)                                       /* unattended Quick Copy: remove the finished card */
             if (g_app[i].quick && g_app[i].dismissAt > 0 && !g_app[i].job && GetTime() >= g_app[i].dismissAt) {
                 RemoveTask(i);
@@ -1388,6 +1754,13 @@ int main(int argc, char **argv)
         for (int i = 0; i < g_count; i++) {
             BuildView(&g_app[i], &views[i]);
             views[i].id = i;
+            if (!views[i].quick && view.sumSel[i] > 0 && view.sumSel[i] <= 4) {      /* a summary tab is picked: size the panel to its list */
+                static const int TAB_FILTER[4] = { 2, 4, 3, 5 };                     /* copied, removed, errors, temp files skipped */
+                ShsTaskRow none[1];
+                int total = 0;
+                QueryRows(&g_app[i], TAB_FILTER[view.sumSel[i] - 1], 0, 0, none, &total);
+                views[i].selRows = total < 1 ? 1 : (total > 8 ? 8 : total);
+            }
             switch (views[i].state) {
                 case SHS_TASK_SYNCING: nActive++; totalRate += views[i].rateMBps; break;
                 case SHS_TASK_IDLE:    nIdle++;   break;
@@ -1655,7 +2028,10 @@ int main(int argc, char **argv)
                         SaveTasks();
                         LogAdd("%s: auto-sync %s", a->def.name, a->def.autoSync ? "on" : "off");
                         break;
-                    case SHS_ACT_REMOVE: RemoveTask(ti); ShsTaskViewRemoved(&view, ti); break;
+                    case SHS_ACT_REMOVE:
+                        if (a->quick) { RemoveTask(ti); ShsTaskViewRemoved(&view, ti); }                 /* a Quick Copy card is just dismissed */
+                        else          { g_del = (DeleteDialog){ true, ti, false, "" }; }              /* a task: ask first, and about its files */
+                        break;
                     case SHS_ACT_ADD_FOLDER: {
                         char picked[SHS_DEF_PATH_MAX] = "";
                         if (ShsPickFolder("Add a folder to this copy", picked, sizeof picked) && picked[0]) {
@@ -1705,6 +2081,16 @@ int main(int argc, char **argv)
                     y += 22;
                 }
             } else if (nav == NAV_SETTINGS) {
+                const float viewTop = y - 8, viewBot = (float)(H - STATUSBAR_H);       /* the page scrolls inside this band */
+                if (!g_block && !dlg.open) g_setScroll -= GetMouseWheelMove() * 48.0f;
+                if (g_setScroll > g_setMax) g_setScroll = g_setMax;
+                if (g_setScroll < 0) g_setScroll = 0;
+                BeginScissorMode(0, (int)viewTop, W, (int)(viewBot - viewTop));
+                const bool prevBlock = g_block;                                        /* scrolled-off widgets must not take clicks */
+                const Vector2 mp = GetMousePosition();
+                if (mp.y < viewTop || mp.y > viewBot) g_block = true;
+                const float contentTop = y;
+                y -= g_setScroll;
                 ShsDrawText("APPEARANCE", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
                 for (int m = 0; m < SHS_THEME_COUNT; m++) {                 /* two rows of theme buttons */
                     const float bwid = 120;
@@ -1749,6 +2135,26 @@ int main(int argc, char **argv)
                 }
                 y = ty + 6;
 
+                ShsDrawText("UPDATES", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
+                v = g_checkUpdates;
+                if (Toggle(px, y + 24, 640, "Check for updates automatically", "Looks for a newer release on GitHub at start-up and once a day, and tells you in the status bar", &v)) {
+                    g_checkUpdates = v;
+                    g_nextUpdateCheck = 0;
+                    SaveSettings();
+                }
+                v = g_updateDev;
+                if (Toggle(px, y + 78, 640, "Include dev builds", "Also tell me about pre-release dev builds (newer features, may be unstable)", &v)) {
+                    g_updateDev = v;
+                    g_updateFound = false;
+                    g_updateMsg[0] = 0;
+                    g_nextUpdateCheck = 0;
+                    SaveSettings();
+                }
+                if (Button((Rectangle){ px, y + 134, 140, 32 }, "Check now", false, false)) UpdateCheckNow(true);
+                if (g_updateMsg[0]) ShsDrawText(g_updateMsg, (int)px + 156, (int)y + 142, 14, g_updateFound ? SHS_COLOR_PRIMARY : SHS_COLOR_TEXT_MUTED);
+                if (g_updateFound && Button((Rectangle){ px + 156 + ShsMeasureText(g_updateMsg, 14) + 16, y + 134, 140, 32 }, "Download", true, false)) ShsOpenUrl(g_updateUrl);
+                y += 182;
+
                 ShsDrawText("COPY PERFORMANCE", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
                 char tv[24];
                 snprintf(tv, sizeof tv, "%d", g_copyThreads);
@@ -1765,7 +2171,11 @@ int main(int argc, char **argv)
                 if (ButtonI((Rectangle){ px, y, 270, 34 }, "Create / reset test sandbox", SHS_ICON_FOLDER, true, false)) CreateSandbox();
                 ShsDrawText("Test folders next to the program, for trying the app on copies instead of real data.", (int)px + 286, (int)y + 9, 13, SHS_COLOR_TEXT_MUTED);
                 ShsDrawText("Mirror tasks permanently delete files in the target that are missing from the source.",
-                            (int)px, (int)y + 46, 13, SHS_COLOR_WARNING);            } else if (nav == NAV_ABOUT) {
+                            (int)px, (int)y + 46, 13, SHS_COLOR_WARNING);
+                EndScissorMode();
+                g_block = prevBlock;
+                g_setMax = fmaxf(0.0f, (y + 46 + 24 + g_setScroll) - contentTop - (viewBot - contentTop));
+            } else if (nav == NAV_ABOUT) {
                 /* header: icon, name, version, tagline */
                 const float icon = 96.0f, tx = px + icon + 24.0f;
                 if (g_logo.id)
@@ -1776,8 +2186,9 @@ int main(int argc, char **argv)
                 ShsDrawText("A tiny, portable, open-source folder sync tool.", (int)tx, (int)y + 68, 15, SHS_COLOR_TEXT_MUTED);
 
                 float cy = y + icon + 24.0f;
-                ShsDrawText("Copies new and changed files from a source folder to a target, with live progress.", (int)px, (int)cy, 15, SHS_COLOR_TEXT_MUTED);
-                ShsDrawText("Mirror mode also removes files from the target that are missing in the source.", (int)px, (int)cy + 24, 15, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Keeps a target folder in step with a source folder, copying only what is new or changed.", (int)px, (int)cy, 15, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Run a task by hand, when the source changes (Auto-sync), or when a USB drive is plugged in.", (int)px, (int)cy + 22, 15, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Mirror mode keeps the target identical, and can move removed files to a \"-deleted\" folder instead.", (int)px, (int)cy + 44, 15, SHS_COLOR_TEXT_MUTED);
 
                 /* details card */
                 const float cw = fminf(pw, 760.0f), rowH = 32.0f;
@@ -1793,7 +2204,7 @@ int main(int argc, char **argv)
                     { "Data folder", NULL },
                 };
                 const int nRows = (int)(sizeof rows / sizeof rows[0]);
-                Rectangle card = { px, cy + 62, cw, rowH * nRows + 20 };
+                Rectangle card = { px, cy + 76, cw, rowH * nRows + 20 };
                 ShsDrawRoundedBox(card, 14.0f, SHS_COLOR_CARD, SHS_COLOR_BORDER);
                 for (int i = 0; i < nRows; i++) {
                     float ry = card.y + 10 + i * rowH;
@@ -1870,9 +2281,26 @@ int main(int argc, char **argv)
         ShsDrawText(disk, 430, sy, 14, SHS_COLOR_TEXT_MUTED);
         const char *ver = "SailHighSea Engine v" SHS_VERSION;
         ShsDrawText(ver, W - ShsMeasureText(ver, 14) - 16, sy, 14, SHS_COLOR_TEXT_MUTED);
+        if (g_updateFound) {                                                   /* newer release: click to open its page */
+            char un[96];
+            snprintf(un, sizeof un, "Update available: %s - click to download", g_updateTag);
+            const int uw = ShsMeasureText(un, 14), ux = W - ShsMeasureText(ver, 14) - 40 - uw;
+            Rectangle ur = { (float)ux - 6, (float)(H - STATUSBAR_H), (float)uw + 12, STATUSBAR_H };
+            bool hot = !dlg.open && CheckCollisionPointRec(GetMousePosition(), ur);
+            ShsDrawText(un, ux, sy, 14, SHS_COLOR_PRIMARY);
+            if (hot) { SetMouseCursor(MOUSE_CURSOR_POINTING_HAND); if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) ShsOpenUrl(g_updateUrl); }
+        }
 
         if (dlg.open) DialogDraw(&dlg, W, H);
         if (conflictTask >= 0 && g_app[conflictTask].job) ConflictDraw(conflictTask, W, H);
+        if (g_del.open) {
+            if (g_del.idx >= g_count || g_app[g_del.idx].quick) g_del.open = false;
+            else {
+                int dr = DeleteDraw(W, H);
+                if (dr == 1) g_del.open = false;
+                else if (dr == 2 && DeleteConfirm()) { RemoveTask(g_del.idx); ShsTaskViewRemoved(&view, g_del.idx); g_del.open = false; }
+            }
+        }
         g_block = false;
 
         if (g_winR >= 0.5f) ShsRoundLines((Rectangle){ 0, 0, (float)W, (float)H }, RoundNess((Rectangle){ 0, 0, (float)W, (float)H }, g_winR), 16, 1.0f, SHS_COLOR_BORDER);
@@ -1882,6 +2310,7 @@ int main(int argc, char **argv)
     }
 
     for (int i = 0; i < g_count; i++) { StopWatch(i); if (g_app[i].job) { ShsSyncFree(g_app[i].job); g_app[i].job = NULL; } }
+    ShsPurgeFree(g_purge);                                  /* stops a deletion that is still running */
     ShsTrayDestroy();
     ShsFontsShutdown();
     if (g_logo.id) UnloadTexture(g_logo);

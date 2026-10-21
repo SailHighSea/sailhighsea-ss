@@ -32,7 +32,7 @@ typedef struct {
     int                state;
 } ShsTaskRow;
 
-/* Supplies rows to the file list: `filter` 0 all, 1 queued / running, 2 done, 3 failed / skipped. Fills up to `max` rows
+/* Supplies rows to the file list: `filter` 0 all, 1 queued / running, 2 done, 3 failed / skipped, 4 removed, 5 ignored temp files. Fills up to `max` rows
    starting at the `first`-th matching one and stores the number of matching rows in *total. Returns rows filled. */
 typedef int (*ShsTaskRowsFn)(void *ctx, int filter, int first, int max, ShsTaskRow *out, int *total);
 
@@ -61,7 +61,7 @@ typedef struct {
     float        progress;                    /* 0..1, SYNCING only */
     float        rateMBps;                    /* SYNCING only */
     float        etaSeconds;                  /* SYNCING only, <0 = unknown */
-    char         meta[96];                    /* e.g. "Last synced: 2m ago | 14 MB" (non-syncing) */
+    char         meta[160];                   /* e.g. "Last synced: 2m ago | 14 MB" (non-syncing) */
     char         currentFile[SHS_TASK_PATH_MAX];  /* SYNCING only */
     char         errorMsg[SHS_TASK_MSG_MAX];  /* ERROR only */
 
@@ -69,7 +69,8 @@ typedef struct {
     ShsTaskFile  files[SHS_TASK_FILES];       /* newest first */
     int          fileCount;
     bool         lastRun;                     /* the list is from the last finished run, not a live one */
-    unsigned long long filesDone, filesTotal, filesRemoved, errors;
+    int          selRows;                     /* sync card: rows shown for the picked summary tab (copied / removed / errors); 0 = the recent-activity list */
+    unsigned long long filesDone, filesTotal, filesRemoved, errors, filesIgnored;   /* ignored: lock / temp files left out of the copy */
 
     /* Quick Copy expanded panel */
     ShsTaskRowsFn rows;                       /* full file list; NULL = none */
@@ -125,6 +126,8 @@ typedef struct {
     int    tab[SHS_TASK_VIEW_MAX];          /* 0 file list, 1 target, 2 options, 3 status, 4 log */
     int    filter[SHS_TASK_VIEW_MAX];       /* file list filter, see ShsTaskRowsFn */
     float  listTop[SHS_TASK_VIEW_MAX];      /* first visible row of the file list */
+    int    sumSel[SHS_TASK_VIEW_MAX];       /* sync card file panel: 0 recent activity, 1 copied, 2 removed, 3 errors, 4 temp files skipped (the clickable summary) */
+    float  sumTop[SHS_TASK_VIEW_MAX];       /* first visible row of that list */
     bool   freeScroll[SHS_TASK_VIEW_MAX];   /* auto-scroll turned off */
     int    reveal;                          /* card id + 1 that was just expanded: scroll it to the top while it opens (0 = none) */
     Rectangle innerRect, innerPrev;        /* screen rect of a scrollable file list (this / previous frame): the wheel scrolls it */

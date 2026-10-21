@@ -25,7 +25,8 @@ typedef enum {
     SHS_FILE_SKIPPED,      /* the user skipped it while it was copying */
     SHS_FILE_VERIFYING,    /* written; being read back and compared */
     SHS_FILE_PENDING,      /* planned, not started yet (only in the full file list) */
-    SHS_FILE_HIDDEN        /* internal: a queued item's placeholder row once its files are listed; never returned */
+    SHS_FILE_HIDDEN,       /* internal: a queued item's placeholder row once its files are listed; never returned */
+    SHS_FILE_IGNORED       /* a lock / temp file of an open document ("~$Report.xlsx"): left out of the copy, listed so the user can see it */
 } ShsFileState;
 
 /* One recent file operation (newest first in ShsSyncStatus.recent). */
@@ -61,6 +62,7 @@ typedef struct {
     uint64_t bytesTotal, bytesDone;
     uint64_t filesDeleted;
     uint64_t filesVerified, filesSkipped;
+    uint64_t filesIgnored;            /* temp / lock files left out of the copy (listed with state SHS_FILE_IGNORED) */
     uint64_t errorCount;
     float    rateMBps;
     char     currentFile[SHS_SYNC_PATH_MAX];  /* UTF-8, relative to source root */
@@ -87,6 +89,12 @@ void ShsSyncConfigure(int threads, int bufferMiB);
    If `mirror` is true, items in the target that are absent from the source are deleted.
    Returns NULL if the thread could not be started. Never blocks the caller. */
 ShsSyncJob *ShsSyncStart(const char *source, const char *target, bool mirror);
+
+/* Like ShsSyncStart, but with `mirror` the target files that are missing from the source are moved to `deletedDir`
+   (keeping their relative path; a name already there gets ".deleted-<time>-<n>" appended) instead of being deleted.
+   `deletedDir` may be inside the target (the mirror pass then leaves it alone); NULL or "" deletes as usual.
+   With `intoFolder` the source folder itself is copied into <target>/<its name> (and mirrored there) instead of just its contents into <target>. */
+ShsSyncJob *ShsSyncStartEx(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder);
 
 /* Quick Copy: copy only (never deletes). Files that already exist in the target are handled by `policy`; with
    SHS_CONFLICT_ASK the job pauses while scanning until the UI answers each one with ShsSyncResolve (see
@@ -133,6 +141,16 @@ bool ShsSyncIsFinished(ShsSyncJob *job);        /* DONE, FAILED or CANCELLED */
 
 /* Cancels if needed, joins the worker thread, and frees the job. */
 void ShsSyncFree(ShsSyncJob *job);
+
+/* Purge: deletes, on a background thread, what a sync task copied into its target (used when a task is deleted on request).
+   - includeFolder: the task's own folder <target>/<source folder name> is removed with everything in it.
+   - otherwise: only files that also exist in `source` (same relative path) are removed, then folders that this leaves empty.
+     Anything else in the target stays. The target folder itself is never removed.
+   Uses the same long-path handling as the copy, so files that Explorer cannot delete (over 260 characters) go too. */
+typedef struct ShsPurgeJob ShsPurgeJob;
+ShsPurgeJob *ShsPurgeStart(const char *source, const char *target, bool includeFolder);
+bool ShsPurgeStatus(ShsPurgeJob *job, uint64_t *deleted, uint64_t *failed);   /* true once finished */
+void ShsPurgeFree(ShsPurgeJob *job);                                          /* cancels if still running, then frees */
 
 /* Creates <testDir>/source_folder and <testDir>/target_folder populated with mock
    files (including an outdated file and a stale extra file in the target, plus one

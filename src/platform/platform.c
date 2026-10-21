@@ -208,6 +208,8 @@ bool ShsSingleInstance(void)
     if (!m || !ev) return true;                            /* cannot tell: just run */
     if (GetLastError() == ERROR_ALREADY_EXISTS) {          /* the mutex call is the last one that set it */
         SetEvent(ev);
+        CloseHandle(ev);
+        CloseHandle(m);       /* a copy waiting to take over after a restart retries: its own handle must not keep the mutex alive */
         return false;
     }
     HANDLE t = CreateThread(NULL, 0, ShowWaiter, ev, 0, NULL);

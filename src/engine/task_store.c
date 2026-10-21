@@ -1,5 +1,6 @@
 #include "task_store.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,8 +25,11 @@ bool ShsStoreSave(const char *path, const ShsTaskDef *defs, int count)
         Flatten(name, sizeof name, defs[i].name);
         Flatten(src, sizeof src, defs[i].source);
         Flatten(dst, sizeof dst, defs[i].target);
-        fprintf(f, "%s\t%s\t%s\t%d\t%lld\t%lld\t%d\n", name, src, dst, defs[i].mirror ? 1 : 0,
-                defs[i].lastSync, defs[i].lastBytes, defs[i].autoSync ? 1 : 0);
+        char del[SHS_DEF_PATH_MAX], usbId[sizeof defs[i].usbId];
+        Flatten(del, sizeof del, defs[i].deletedDir);
+        Flatten(usbId, sizeof usbId, defs[i].usbId);
+        fprintf(f, "%s\t%s\t%s\t%d\t%lld\t%lld\t%d\t%d\t%s\t%d\t%s\t%d\n", name, src, dst, defs[i].mirror ? 1 : 0,
+                defs[i].lastSync, defs[i].lastBytes, defs[i].autoSync ? 1 : 0, defs[i].usbSync ? 1 : 0, del, defs[i].includeFolder ? 1 : 0, usbId, defs[i].usbMark ? 1 : 0);
     }
     bool ok = fclose(f) == 0;
     if (ok) {
@@ -42,15 +46,15 @@ int ShsStoreLoad(const char *path, ShsTaskDef *out, int max)
     if (!f) return 0;
 
     int n = 0;
-    char line[1024];
+    char line[2048];
     while (n < max && fgets(line, sizeof line, f)) {
         size_t len = strlen(line);
         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
         if (!len) continue;
 
-        char *field[7] = { 0 };
+        char *field[12] = { 0 };
         int nf = 0;
-        for (char *p = line; nf < 7; ) {
+        for (char *p = line; nf < 12; ) {
             field[nf++] = p;
             char *tab = strchr(p, '\t');
             if (!tab) break;
@@ -68,6 +72,15 @@ int ShsStoreLoad(const char *path, ShsTaskDef *out, int max)
         d->lastSync  = nf > 4 ? atoll(field[4]) : 0;
         d->lastBytes = nf > 5 ? atoll(field[5]) : 0;
         d->autoSync  = nf > 6 && atoi(field[6]) != 0;
+        d->usbSync   = nf > 7 && atoi(field[7]) != 0;
+        if (nf > 8) snprintf(d->deletedDir, sizeof d->deletedDir, "%s", field[8]);
+        d->includeFolder = nf > 9 && atoi(field[9]) != 0;
+        d->usbMark = nf > 11 ? atoi(field[11]) != 0 : true;
+        if (nf > 10) {                                            /* a 16-digit hex id; anything else (an older build's number) is dropped */
+            size_t k = 0;
+            while (field[10][k] && isxdigit((unsigned char)field[10][k])) k++;
+            if (k == 16 && !field[10][k]) snprintf(d->usbId, sizeof d->usbId, "%s", field[10]);
+        }
     }
     fclose(f);
     return n;
