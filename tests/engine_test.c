@@ -590,6 +590,49 @@ int main(int argc, char **argv)
         RemoveTree(isrc); RemoveTree(idst);
     }
 
+    /* ---- excluded folders: not copied, and left alone in the target by mirror ---- */
+    {
+        printf("excluded folders are not copied and survive mirror\n");
+        char esrc[700], edst[700], p[900];
+        snprintf(esrc, sizeof esrc, "%s/excl_src", g_base);
+        snprintf(edst, sizeof edst, "%s/excl_dst", g_base);
+        RemoveTree(esrc); RemoveTree(edst);
+        MKDIR(g_base); MKDIR(esrc); MKDIR(edst);
+        snprintf(p, sizeof p, "%s/keep", esrc);             MKDIR(p);
+        snprintf(p, sizeof p, "%s/node_modules", esrc);     MKDIR(p);
+        snprintf(p, sizeof p, "%s/keep/Node_Modules", esrc); MKDIR(p);                   /* a bare name matches at any depth, ignoring case */
+        snprintf(p, sizeof p, "%s/build", esrc);            MKDIR(p);
+        snprintf(p, sizeof p, "%s/build/cache", esrc);      MKDIR(p);
+        snprintf(p, sizeof p, "%s/build/out", esrc);        MKDIR(p);
+        snprintf(p, sizeof p, "%s/keep/a.txt", esrc);                MakeFilled(p, 1000, 81);
+        snprintf(p, sizeof p, "%s/node_modules/x.js", esrc);         MakeFilled(p, 1100, 82);
+        snprintf(p, sizeof p, "%s/keep/Node_Modules/y.js", esrc);    MakeFilled(p, 1200, 83);
+        snprintf(p, sizeof p, "%s/build/cache/c.bin", esrc);         MakeFilled(p, 1300, 84);
+        snprintf(p, sizeof p, "%s/build/out/o.bin", esrc);           MakeFilled(p, 1400, 85);
+        snprintf(p, sizeof p, "%s/node_modules", edst);              MKDIR(p);
+        snprintf(p, sizeof p, "%s/node_modules/old.js", edst);       MakeFilled(p, 900, 86);   /* already in the target: mirror must keep it */
+        snprintf(p, sizeof p, "%s/stale.txt", edst);                 MakeFilled(p, 800, 87);   /* not excluded: mirror removes it */
+
+        ShsSyncJob *j = ShsSyncStartExcl(esrc, edst, true, NULL, false, "node_modules|build\\cache");
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        ShsSyncStatus s; memset(&s, 0, sizeof s);
+        if (j) { ShsSyncGetStatus(j, &s); ShsSyncFree(j); }
+        CHECK(s.state == SHS_SYNC_DONE && s.errorCount == 0 && s.filesDone == 2);
+        CHECK(SizeOf(edst, "keep/a.txt") == 1000 && SizeOf(edst, "build/out/o.bin") == 1400);
+        CHECK(SizeOf(edst, "node_modules/x.js") < 0 && SizeOf(edst, "keep/Node_Modules/y.js") < 0 && SizeOf(edst, "build/cache/c.bin") < 0);
+        CHECK(SizeOf(edst, "node_modules/old.js") == 900);
+        CHECK(SizeOf(edst, "stale.txt") < 0);
+
+        ShsTaskDef def; memset(&def, 0, sizeof def);                                    /* the list is saved with the task */
+        snprintf(def.name, sizeof def.name, "t"); snprintf(def.source, sizeof def.source, "a"); snprintf(def.target, sizeof def.target, "b");
+        snprintf(def.exclude, sizeof def.exclude, "node_modules|build/cache");
+        char sf[800]; snprintf(sf, sizeof sf, "%s/excl_tasks.txt", g_base);
+        ShsTaskDef back[2];
+        CHECK(ShsStoreSave(sf, &def, 1) && ShsStoreLoad(sf, back, 2) == 1 && !strcmp(back[0].exclude, def.exclude));
+        remove(sf);
+        RemoveTree(esrc); RemoveTree(edst);
+    }
+
     /* ---- purge: delete what a task copied into its target, nothing else ---- */
     {
         printf("purge deletes only what the task copied\n");

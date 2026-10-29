@@ -51,7 +51,8 @@ int  ShsTrayPoll(void);                     /* returns and clears the SHS_TRAY_*
 
 /* ---- folder watcher: tells the app when anything under a folder changed ---- */
 typedef struct ShsWatch ShsWatch;
-ShsWatch *ShsWatchStart(const char *folder);   /* NULL if the folder cannot be watched */
+ShsWatch *ShsWatchStart(const char *folder, const char *excludes);   /* NULL if the folder cannot be watched; changes inside the excluded folders ("name|sub/path|...", may be NULL) are ignored */
+bool      ShsWatchExcluded(const char *excludes, const char *rel);
 bool      ShsWatchTake(ShsWatch *w);           /* true once per burst of changes since the last call */
 void      ShsWatchStop(ShsWatch *w);
 

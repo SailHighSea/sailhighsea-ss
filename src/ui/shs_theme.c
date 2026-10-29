@@ -468,9 +468,15 @@ bool ShsDrawProgress(Rectangle tr, float p, Color col)
     switch (s->progress) {
         case PROG_BLOCKS: {
             ShsDrawBevel(tr, true, t->card);
-            float fillW = (tr.width - 6.0f) * p;
-            for (float bx = tr.x + 3; bx + 7.0f <= tr.x + 3 + fillW + 0.5f; bx += 8.0f)
-                DrawRectangle((int)bx, (int)tr.y + 3, 7, (int)tr.height - 6, col);
+            const float inner = tr.width - 6.0f;                 /* ~8 px blocks, stretched so 100% fills the whole track */
+            int n = (int)((inner + 1.0f) / 8.0f);
+            if (n < 1) n = 1;
+            const float step = (inner + 1.0f) / n;
+            const int lit = p >= 1.0f ? n : (int)(n * p + 0.0001f);
+            for (int k = 0; k < lit; k++) {
+                int x0 = (int)(k * step), x1 = (int)((k + 1) * step) - 1;
+                DrawRectangle((int)tr.x + 3 + x0, (int)tr.y + 3, x1 - x0, (int)tr.height - 6, col);
+            }
         } return true;
         case PROG_SOLID:
             ShsDrawBevel(tr, true, t->card);

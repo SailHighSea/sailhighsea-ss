@@ -9,6 +9,51 @@
 #include <wchar.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+
+static int ShsNoCaseCmp(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
+        if (x != y) return x - y;
+    }
+    return 0;
+}
+
+/* Is `rel` ('/' or '\' separated, relative to the watched folder) inside an excluded folder? `list` is "name|sub/path|..."
+   (see ShsSyncStartExcl): a bare name matches any path component, a path matches itself and everything below it. */
+bool ShsWatchExcluded(const char *list, const char *rel)
+{
+    if (!list || !list[0]) return false;
+    char r[1100];
+    size_t rn = 0;
+    for (; rel[rn] && rn + 1 < sizeof r; rn++) r[rn] = rel[rn] == '\\' ? '/' : rel[rn];
+    r[rn] = 0;
+    for (const char *p = list; *p; ) {
+        const char *e = strchr(p, '|');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        char pat[300];
+        size_t k = 0;
+        for (size_t i = 0; i < n && k + 1 < sizeof pat; i++) pat[k++] = p[i] == '\\' ? '/' : p[i];
+        pat[k] = 0;
+        p = e ? e + 1 : p + n;
+        char *s = pat;
+        while (*s == '/') s++;
+        for (size_t l = strlen(s); l && s[l - 1] == '/'; ) s[--l] = 0;
+        size_t pl = strlen(s);
+        if (!pl) continue;
+        if (!strchr(s, '/')) {
+            for (const char *c = r; *c; ) {
+                const char *sl = strchr(c, '/');
+                size_t cl = sl ? (size_t)(sl - c) : strlen(c);
+                if (cl == pl && !ShsNoCaseCmp(c, s, pl)) return true;
+                if (!sl) break;
+                c = sl + 1;
+            }
+        } else if (rn >= pl && !ShsNoCaseCmp(r, s, pl) && (rn == pl || r[pl] == '/')) return true;
+    }
+    return false;
+}
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -267,6 +312,7 @@ struct ShsWatch {
     volatile LONG  changed, stop;
     OVERLAPPED     ov;
     BYTE           buf[64 * 1024];
+    char           excl[1024];                 /* excluded folders: changes inside them are not reported */
 };
 
 static DWORD WINAPI WatchThread(LPVOID p)
@@ -283,12 +329,22 @@ static DWORD WINAPI WatchThread(LPVOID p)
         if (w->stop) { CancelIoEx(w->dir, &w->ov); break; }
         DWORD got = 0;
         GetOverlappedResult(w->dir, &w->ov, &got, FALSE);        /* got == 0 means the buffer overflowed: still a change */
-        InterlockedExchange(&w->changed, 1);
+        bool real = got == 0 || !w->excl[0];
+        for (BYTE *q = w->buf; !real && got; ) {                   /* only changes outside the excluded folders count */
+            FILE_NOTIFY_INFORMATION *fi = (FILE_NOTIFY_INFORMATION *)q;
+            char rel[1100];
+            int n = WideCharToMultiByte(CP_UTF8, 0, fi->FileName, (int)(fi->FileNameLength / sizeof(WCHAR)), rel, (int)sizeof rel - 1, NULL, NULL);
+            rel[n > 0 ? n : 0] = 0;
+            if (n <= 0 || !ShsWatchExcluded(w->excl, rel)) real = true;
+            if (!fi->NextEntryOffset) break;
+            q += fi->NextEntryOffset;
+        }
+        if (real) InterlockedExchange(&w->changed, 1);
     }
     return 0;
 }
 
-ShsWatch *ShsWatchStart(const char *folder)
+ShsWatch *ShsWatchStart(const char *folder, const char *excludes)
 {
     wchar_t wp[1024];
     if (!MultiByteToWideChar(CP_UTF8, 0, folder, -1, wp, 1024)) return NULL;
@@ -298,6 +354,7 @@ ShsWatch *ShsWatchStart(const char *folder)
     ShsWatch *w = (ShsWatch *)calloc(1, sizeof *w);
     if (!w) { CloseHandle(dir); return NULL; }
     w->dir = dir;
+    if (excludes) snprintf(w->excl, sizeof w->excl, "%s", excludes);
     w->evt = CreateEventW(NULL, TRUE, FALSE, NULL);
     w->thread = CreateThread(NULL, 0, WatchThread, w, 0, NULL);
     if (!w->evt || !w->thread) { ShsWatchStop(w); return NULL; }
@@ -497,11 +554,12 @@ bool ShsAutostartSet(bool enable, bool startHidden)
 
 struct ShsWatch {
     char          folder[1024];
+    char          excl[1024];                  /* excluded folders: not part of the signature */
     pthread_t     thread;
     volatile int  changed, stop;
 };
 
-static void Signature(const char *dir, unsigned long long *count, long long *newest, unsigned long long *bytes, int depth)
+static void Signature(const ShsWatch *w, const char *dir, unsigned long long *count, long long *newest, unsigned long long *bytes, int depth)
 {
     DIR *d = opendir(dir);
     if (!d || depth > 32) { if (d) closedir(d); return; }
@@ -512,9 +570,10 @@ static void Signature(const char *dir, unsigned long long *count, long long *new
         snprintf(full, sizeof full, "%s/%s", dir, de->d_name);
         struct stat st;
         if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        if (w->excl[0] && ShsWatchExcluded(w->excl, full + strlen(w->folder) + 1)) continue;
         (*count)++;
         if ((long long)st.st_mtime > *newest) *newest = (long long)st.st_mtime;
-        if (S_ISDIR(st.st_mode)) Signature(full, count, newest, bytes, depth + 1);
+        if (S_ISDIR(st.st_mode)) Signature(w, full, count, newest, bytes, depth + 1);
         else *bytes += (unsigned long long)st.st_size;
     }
     closedir(d);
@@ -524,23 +583,24 @@ static void *WatchThread(void *p)
 {
     ShsWatch *w = (ShsWatch *)p;
     unsigned long long c0 = 0, b0 = 0; long long n0 = 0;
-    Signature(w->folder, &c0, &n0, &b0, 0);
+    Signature(w, w->folder, &c0, &n0, &b0, 0);
     while (!w->stop) {
         for (int i = 0; i < 30 && !w->stop; i++) usleep(100 * 1000);
         unsigned long long c = 0, b = 0; long long n = 0;
-        Signature(w->folder, &c, &n, &b, 0);
+        Signature(w, w->folder, &c, &n, &b, 0);
         if (c != c0 || b != b0 || n != n0) { c0 = c; b0 = b; n0 = n; w->changed = 1; }
     }
     return NULL;
 }
 
-ShsWatch *ShsWatchStart(const char *folder)
+ShsWatch *ShsWatchStart(const char *folder, const char *excludes)
 {
     struct stat st;
     if (stat(folder, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
     ShsWatch *w = (ShsWatch *)calloc(1, sizeof *w);
     if (!w) return NULL;
     snprintf(w->folder, sizeof w->folder, "%s", folder);
+    if (excludes) snprintf(w->excl, sizeof w->excl, "%s", excludes);
     if (pthread_create(&w->thread, NULL, WatchThread, w) != 0) { free(w); return NULL; }
     return w;
 }

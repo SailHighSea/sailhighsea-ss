@@ -6,6 +6,7 @@
 
 #define SHS_SYNC_PATH_MAX 520
 #define SHS_SYNC_MSG_MAX  200
+#define SHS_SYNC_EXCL_MAX 32     /* excluded folders per task */
 
 typedef enum {
     SHS_SYNC_PENDING = 0,  /* thread started, not scanning yet */
@@ -95,6 +96,11 @@ ShsSyncJob *ShsSyncStart(const char *source, const char *target, bool mirror);
    `deletedDir` may be inside the target (the mirror pass then leaves it alone); NULL or "" deletes as usual.
    With `intoFolder` the source folder itself is copied into <target>/<its name> (and mirrored there) instead of just its contents into <target>. */
 ShsSyncJob *ShsSyncStartEx(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder);
+
+/* Like ShsSyncStartEx, with excluded folders: `excludes` is "name|sub/path|..." ('\' and '/' both work). A bare name matches
+   a folder of that name at any depth; a path is relative to the source. Excluded folders are not copied, and with `mirror`
+   whatever already lies in them in the target is left alone. */
+ShsSyncJob *ShsSyncStartExcl(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder, const char *excludes);
 
 /* Quick Copy: copy only (never deletes). Files that already exist in the target are handled by `policy`; with
    SHS_CONFLICT_ASK the job pauses while scanning until the UI answers each one with ShsSyncResolve (see

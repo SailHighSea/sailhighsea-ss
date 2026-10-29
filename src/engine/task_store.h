@@ -20,9 +20,10 @@ typedef struct {
     char      usbId[24];    /* USB sync: id written to the target folder's .simplesync-id marker ("" = no marker written yet) */
     bool      usbMark;      /* USB sync: write the hidden ID file into the target (on by default; older task files load as on) */
     char      deletedDir[SHS_DEF_PATH_MAX];   /* mirror: move removed target files here instead of deleting them ("" = delete) */
+    char      exclude[1024]; /* excluded source folders, '|' separated ("" = none) */
 } ShsTaskDef;
 
-/* Plain text, one task per line: name \t source \t target \t mirror \t lastSync \t lastBytes \t autoSync \t usbSync \t deletedDir \t includeFolder \t usbId \t usbMark.
+/* Plain text, one task per line: name \t source \t target \t mirror \t lastSync \t lastBytes \t autoSync \t usbSync \t deletedDir \t includeFolder \t usbId \t usbMark \t exclude.
    Older files with fewer columns still load.
    Returns the number of tasks read (0 if the file is missing). */
 int  ShsStoreLoad(const char *path, ShsTaskDef *out, int max);

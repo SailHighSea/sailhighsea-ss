@@ -102,6 +102,10 @@ typedef struct {
     bool drag;                             /* drag & drop zones instead of the folder text fields */
     bool quick;                            /* Quick Copy: one-off copy, nothing saved */
     char err[120];
+    char exclude[1024];                    /* excluded source folders, '|' separated (see ShsSyncStartExcl) */
+    char exclIn[SHS_DEF_PATH_MAX];         /* text being typed in the excluded-folders panel */
+    char exclErr[120];
+    bool exclOpen;                         /* the excluded-folders panel replaces the dialog */
 } Dialog;
 
 static bool      g_autostart = false;        /* registered to start with the system (read from the OS) */
@@ -445,13 +449,14 @@ static bool Stepper(float x, float y, const char *label, int *value, int lo, int
     return changed;
 }
 
+static void DrawSwitch(Rectangle sw, bool on);
+
 /* Settings-page switch: label + hint, returns true when clicked (and flips *value). */
 static bool Toggle(float x, float y, float w, const char *label, const char *hint, bool *value)
 {
     Rectangle row = { x, y, w, 46 };
     Rectangle sw = { x, y + 3, 44, 24 };
-    ShsRoundRec(sw, 1.0f, 16, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
-    DrawCircleV((Vector2){ sw.x + (*value ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
+    DrawSwitch(sw, *value);
     ShsDrawText(label, (int)x + 58, (int)y + 1, 16, SHS_COLOR_TEXT_MAIN);
     ShsDrawText(hint, (int)x + 58, (int)y + 23, 13, SHS_COLOR_TEXT_MUTED);
     if (CheckCollisionPointRec(Mouse(), row) && Pressed()) { *value = !*value; return true; }
@@ -593,7 +598,7 @@ static void StartTaskItem(int i, const char *item)
     snprintf(a->runTarget, sizeof a->runTarget, "%s", tgt);
     if (item)          a->job = ShsSyncStartItem(item, a->def.target, SHS_CONFLICT_ASK);
     else if (a->quick) a->job = ShsSyncStartItem(a->def.source, a->def.target, SHS_CONFLICT_ASK);   /* the folder itself lands in the target, like dropped folders */
-    else               a->job = ShsSyncStartEx(a->def.source, tgt, a->def.mirror, del, a->def.includeFolder);
+    else               a->job = ShsSyncStartExcl(a->def.source, tgt, a->def.mirror, del, a->def.includeFolder, a->def.exclude);
     if (!a->job) {
         a->failed = true;
         snprintf(a->resultMsg, sizeof a->resultMsg, "Could not start the sync thread.");
@@ -732,7 +737,7 @@ static void WatchTasks(void)
         if (!a->def.autoSync) { if (a->watch) StopWatch(i); continue; }
         if (!a->watch) {
             if (now < a->nextWatchTry) continue;
-            a->watch = ShsWatchStart(a->def.source);
+            a->watch = ShsWatchStart(a->def.source, a->def.exclude);
             if (!a->watch) { a->nextWatchTry = now + 5.0; continue; }          /* folder missing: try again in a few seconds */
             LogAdd("%s: auto-sync watching %s", a->def.name, a->def.source);
             a->pending = true;
@@ -916,6 +921,13 @@ static void BuildView(const AppTask *a, ShsTask *v)
     if (a->def.mirror && a->def.deletedDir[0]) strncat(meta, " (keeps deleted files)", sizeof meta - strlen(meta) - 1);
     if (a->def.autoSync) strncat(meta, " | Auto-sync", sizeof meta - strlen(meta) - 1);
     if (a->def.usbSync) strncat(meta, " | USB sync", sizeof meta - strlen(meta) - 1);
+    if (a->def.exclude[0]) {
+        int n = 1;
+        for (const char *c = a->def.exclude; *c; c++) if (*c == '|') n++;
+        char ex[32];
+        snprintf(ex, sizeof ex, " | %d excluded", n);
+        strncat(meta, ex, sizeof meta - strlen(meta) - 1);
+    }
     snprintf(v->meta, sizeof v->meta, "%s", meta);
 
     if (a->failed) {
@@ -977,7 +989,68 @@ static void DialogOpen(Dialog *d, int editIdx)
         d->includeFolder = t->includeFolder;
         d->keepDeleted = t->deletedDir[0] != 0;
         snprintf(d->del, sizeof d->del, "%s", t->deletedDir);
+        snprintf(d->exclude, sizeof d->exclude, "%s", t->exclude);
     }
+}
+
+/* ---- excluded folders (the list is one '|' separated string) ---- */
+
+#define EXCL_UI_MAX 8
+
+static int ExclCount(const char *list)
+{
+    if (!list[0]) return 0;
+    int n = 1;
+    for (const char *c = list; *c; c++) if (*c == '|') n++;
+    return n;
+}
+
+static void ExclGet(const char *list, int idx, char *out, size_t cap)
+{
+    out[0] = 0;
+    for (const char *p = list; *p; ) {
+        const char *e = strchr(p, '|');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (idx-- == 0) { if (n >= cap) n = cap - 1; memcpy(out, p, n); out[n] = 0; return; }
+        if (!e) return;
+        p = e + 1;
+    }
+}
+
+static void ExclRemove(char *list, int idx)
+{
+    char out[1024] = "";
+    for (int i = 0, k = 0, n = ExclCount(list); i < n; i++) {
+        if (i == idx) continue;
+        char item[SHS_DEF_PATH_MAX];
+        ExclGet(list, i, item, sizeof item);
+        snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", k++ ? "|" : "", item);
+    }
+    snprintf(list, 1024, "%s", out);
+}
+
+/* Adds a folder name or a path relative to the source; sets d->exclErr and returns false when it is refused. */
+static bool ExclAdd(Dialog *d, const char *text)
+{
+    char item[SHS_DEF_PATH_MAX];
+    snprintf(item, sizeof item, "%s", text);
+    for (char *c = item; *c; c++) if (*c == '\\') *c = '/';
+    char *s = item;
+    while (*s == ' ' || *s == '/') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '/')) s[--n] = 0;
+    d->exclErr[0] = 0;
+    if (!n) return false;
+    if (strchr(s, '|') || strchr(s, ':') || !strncmp(s, "../", 3) || strstr(s, "/../")) { snprintf(d->exclErr, sizeof d->exclErr, "Use a folder name or a path inside the source folder."); return false; }
+    int cnt = ExclCount(d->exclude);
+    if (cnt >= EXCL_UI_MAX || strlen(d->exclude) + n + 2 >= sizeof d->exclude) { snprintf(d->exclErr, sizeof d->exclErr, "Up to %d excluded folders.", EXCL_UI_MAX); return false; }
+    for (int i = 0; i < cnt; i++) {
+        char other[SHS_DEF_PATH_MAX];
+        ExclGet(d->exclude, i, other, sizeof other);
+        if (!strcmp(other, s)) { snprintf(d->exclErr, sizeof d->exclErr, "Already in the list."); return false; }
+    }
+    snprintf(d->exclude + strlen(d->exclude), sizeof d->exclude - strlen(d->exclude), "%s%s", cnt ? "|" : "", s);
+    return true;
 }
 
 static void DialogOpenQuick(Dialog *d)
@@ -1041,6 +1114,7 @@ static void DialogSubmit(Dialog *d)
     else if (!(sameTarget && a->def.usbId[0]) && !UsbWriteMarker(&a->def, d->dst))     /* a new target: the user picked this stick, so mark it */
         a->def.usbId[0] = 0;                                                           /* ...folder not there yet: the first good sync marks it */
     a->def.includeFolder = d->includeFolder;
+    snprintf(a->def.exclude, sizeof a->def.exclude, "%s", d->exclude);
     snprintf(a->def.deletedDir, sizeof a->def.deletedDir, "%s", d->mirror && d->keepDeleted ? d->del : "");
     a->usbInit = false;                          /* start watching the drive again from its current state */
     StopWatch((int)(a - g_app));                 /* restart the watcher on the (possibly new) source folder */
@@ -1423,8 +1497,211 @@ static int DeleteDraw(int W, int H)
     return result;
 }
 
+/* Switch knob: round, or square in the square themes (raised in the bevel themes). */
+static void DrawSwitch(Rectangle sw, bool on)
+{
+    if (ShsThemeClassic() && !ShsThemeFlat() && !ShsThemeBevel()) {      /* Mac Platinum, GNOME 2: a rounded square, not a pill */
+        ShsDrawRoundedBox(sw, 4.0f, on ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER, (Color){ 0, 0, 0, 0 });
+        ShsDrawRoundedBox((Rectangle){ sw.x + (on ? 24.0f : 3.0f), sw.y + 3, 17, 18 }, 3.0f, SHS_COLOR_ON_PRIMARY, (Color){ 0, 0, 0, 0 });
+        return;
+    }
+    ShsRoundRec(sw, 1.0f, 16, on ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
+    if (ShsThemeFlat() || ShsThemeBevel()) {
+        Rectangle k = { sw.x + (on ? 24.0f : 3.0f), sw.y + 3, 17, 18 };
+        if (ShsThemeBevel()) ShsDrawBevel(k, false, SHS_COLOR_BG);
+        else                 DrawRectangleRec(k, SHS_COLOR_ON_PRIMARY);
+    } else DrawCircleV((Vector2){ sw.x + (on ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
+}
+
+/* ---- excluded-folders tree: the source folder's subfolders, each with a tick (ticked = copied) ---- */
+
+#define TREE_MAX 600
+
+typedef struct { char rel[SHS_DEF_PATH_MAX]; int depth; bool open, leaf; } TreeNode;
+
+static TreeNode g_tree[TREE_MAX];
+static int      g_treeN = 0, g_treeScroll = 0;
+static bool     g_treeReady = false;                /* cleared when the panel opens: the tree is read again */
+
+static bool ExclEq(const char *a, size_t n, const char *b)
+{
+    for (size_t i = 0; i < n; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return b[n] == 0;
+}
+
+/* How an entry of the list applies to the folder `rel`: 2 = it excludes this very folder, 1 = it excludes a parent, 0 = no. */
+static int ExclEntryHit(const char *e, const char *rel)
+{
+    size_t el = strlen(e), rl = strlen(rel);
+    if (!strchr(e, '/')) {
+        int hit = 0;
+        for (const char *c = rel; *c; ) {
+            const char *s = strchr(c, '/');
+            size_t cl = s ? (size_t)(s - c) : strlen(c);
+            if (cl == el && ExclEq(c, cl, e)) hit = s ? 1 : 2;
+            if (!s) break;
+            c = s + 1;
+        }
+        return hit;
+    }
+    if (rl == el && ExclEq(rel, el, e)) return 2;
+    if (rl > el && rel[el] == '/' && ExclEq(rel, el, e)) return 1;
+    return 0;
+}
+
+static int ExclStatus(const char *list, const char *rel)
+{
+    int best = 0;
+    for (int i = 0, n = ExclCount(list); i < n; i++) {
+        char e[SHS_DEF_PATH_MAX];
+        ExclGet(list, i, e, sizeof e);
+        int h = ExclEntryHit(e, rel);
+        if (h > best) best = h;
+    }
+    return best;
+}
+
+static int TreeNameCmp(const void *a, const void *b)
+{
+    const char *x = GetFileName(*(const char *const *)a), *y = GetFileName(*(const char *const *)b);
+    for (; *x && *y; x++, y++) {
+        int cx = tolower((unsigned char)*x), cy = tolower((unsigned char)*y);
+        if (cx != cy) return cx - cy;
+    }
+    return tolower((unsigned char)*x) - tolower((unsigned char)*y);
+}
+
+/* Lists the subfolders of node `idx` (-1 = the source folder itself) right below it. */
+static void TreeLoad(const char *src, int idx)
+{
+    char dir[SHS_DEF_PATH_MAX * 2];
+    if (idx < 0) snprintf(dir, sizeof dir, "%s", src);
+    else         snprintf(dir, sizeof dir, "%s/%s", src, g_tree[idx].rel);
+    FilePathList fl = LoadDirectoryFiles(dir);
+    const char *dirs[512];
+    int nd = 0;
+    for (unsigned i = 0; i < fl.count && nd < 512; i++) if (DirectoryExists(fl.paths[i])) dirs[nd++] = fl.paths[i];
+    qsort(dirs, (size_t)nd, sizeof dirs[0], TreeNameCmp);
+    int room = TREE_MAX - g_treeN, ins = nd < room ? nd : room, at = idx + 1;
+    memmove(&g_tree[at + ins], &g_tree[at], (size_t)(g_treeN - at) * sizeof g_tree[0]);
+    for (int i = 0; i < ins; i++) {
+        TreeNode *n = &g_tree[at + i];
+        memset(n, 0, sizeof *n);
+        const char *nm = GetFileName(dirs[i]);
+        if (idx < 0) snprintf(n->rel, sizeof n->rel, "%s", nm);
+        else         snprintf(n->rel, sizeof n->rel, "%s/%s", g_tree[idx].rel, nm);
+        n->depth = idx < 0 ? 0 : g_tree[idx].depth + 1;
+    }
+    g_treeN += ins;
+    if (idx >= 0) { g_tree[idx].open = true; g_tree[idx].leaf = nd == 0; }
+    UnloadDirectoryFiles(fl);
+}
+
+static void TreeCollapse(int idx)
+{
+    int end = idx + 1;
+    while (end < g_treeN && g_tree[end].depth > g_tree[idx].depth) end++;
+    memmove(&g_tree[idx + 1], &g_tree[end], (size_t)(g_treeN - end) * sizeof g_tree[0]);
+    g_treeN -= end - idx - 1;
+    g_tree[idx].open = false;
+}
+
+/* The excluded-folders panel (replaces the task dialog while open). */
+static void DialogExclDraw(Dialog *d, int W, int H)
+{
+    g_block = false;
+    FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
+    const float pw = 640, ph = fminf(560.0f, (float)H - 40);
+    Rectangle p = { (W - pw) / 2, (H - ph) / 2, pw, ph };
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
+    const float x = p.x + 24, w = pw - 48;
+    ShsDrawText("Excluded folders", (int)x, (int)p.y + 20, 22, SHS_COLOR_TEXT_MAIN);
+    ShsDrawText("Untick a folder to leave it out of the sync. Tick it again to bring it back.", (int)x, (int)p.y + 54, 13, SHS_COLOR_TEXT_MUTED);
+    ShsDrawText("Typing a name (node_modules) leaves out every folder of that name, at any depth.", (int)x, (int)p.y + 72, 13, SHS_COLOR_TEXT_MUTED);
+
+    Rectangle fIn = { x, p.y + 96, w - 100, 32 }, bAdd = { x + w - 90, p.y + 96, 90, 32 };
+    HandleTyping(d->exclIn, sizeof d->exclIn);
+    DrawField(fIn, d->exclIn, "Folder name to leave out everywhere", true, SHS_ICON_NONE);
+    bool add = ButtonI(bAdd, "Add", SHS_ICON_PLUS, false, false);
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        if (d->exclIn[0]) add = true;
+        else { d->exclOpen = false; return; }
+    }
+    if (add && ExclAdd(d, d->exclIn)) d->exclIn[0] = 0;
+    if (d->exclErr[0]) ShsDrawText(d->exclErr, (int)x, (int)p.y + 132, 14, SHS_COLOR_DANGER);
+
+    /* the tree */
+    const float rowH = 26;
+    Rectangle box = { x, p.y + 154, w, ph - 154 - 70 };
+    ShsDrawRoundedBox(box, 6.0f, SHS_COLOR_CARD, SHS_COLOR_BORDER);
+    const int vis = (int)((box.height - 8) / rowH);
+    if (!d->src[0] || !DirectoryExists(d->src)) {
+        ShsDrawText("Choose an existing source folder first.", (int)box.x + 12, (int)box.y + 12, 15, SHS_COLOR_TEXT_MUTED);
+    } else {
+        if (!g_treeReady) { g_treeReady = true; g_treeN = 0; g_treeScroll = 0; TreeLoad(d->src, -1); }
+        if (g_treeN == 0) ShsDrawText("This folder has no subfolders.", (int)box.x + 12, (int)box.y + 12, 15, SHS_COLOR_TEXT_MUTED);
+        if (CheckCollisionPointRec(GetMousePosition(), box)) g_treeScroll -= (int)GetMouseWheelMove() * 3;
+        if (g_treeScroll > g_treeN - vis) g_treeScroll = g_treeN - vis;
+        if (g_treeScroll < 0) g_treeScroll = 0;
+        const bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        const Vector2 m = GetMousePosition();
+        int toggle = -1, expand = -1;
+        for (int r = 0; r < vis && g_treeScroll + r < g_treeN; r++) {
+            const int i = g_treeScroll + r;
+            const TreeNode *n = &g_tree[i];
+            const float ry = box.y + 4 + r * rowH, ix = box.x + 8 + n->depth * 22.0f;
+            const int st = ExclStatus(d->exclude, n->rel);
+            Rectangle arrow = { ix, ry, 20, rowH }, cb = { ix + 22, ry + 4, 18, 18 };
+            if (!n->leaf) {
+                ShsDrawText(n->open ? "-" : "+", (int)ix + 6, (int)ry + 5, 15, SHS_COLOR_TEXT_MUTED);
+                if (click && CheckCollisionPointRec(m, arrow)) expand = i;
+            }
+            ShsRoundRec(cb, 0.25f, 6, st ? SHS_COLOR_BG : SHS_COLOR_PRIMARY);
+            ShsRoundLines(cb, 0.25f, 6, 1.0f, st == 1 ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_BORDER);
+            if (!st) {
+                DrawLineEx((Vector2){ cb.x + 4, cb.y + 9 }, (Vector2){ cb.x + 8, cb.y + 13 }, 2, SHS_COLOR_ON_PRIMARY);
+                DrawLineEx((Vector2){ cb.x + 8, cb.y + 13 }, (Vector2){ cb.x + 14, cb.y + 5 }, 2, SHS_COLOR_ON_PRIMARY);
+            }
+            ShsDrawIcon(SHS_ICON_FOLDER, cb.x + 34, ry + rowH / 2, 15.0f, st ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_PRIMARY);
+            char fit[SHS_DEF_PATH_MAX];
+            const char *nm = strrchr(n->rel, '/');
+            nm = nm ? nm + 1 : n->rel;
+            const float tx = cb.x + 50;
+            ShsDrawText(FitTail(fit, sizeof fit, nm, 14, box.x + box.width - tx - 8), (int)tx, (int)ry + 6, 14, st ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_TEXT_MAIN);
+            Rectangle hit = { cb.x - 2, ry, box.x + box.width - cb.x - 2, rowH };
+            if (click && st != 1 && CheckCollisionPointRec(m, hit)) toggle = i;
+        }
+        if (g_treeN > vis) {                                          /* scroll bar */
+            float th = fmaxf(24.0f, (box.height - 8) * vis / g_treeN);
+            float ty = box.y + 4 + (box.height - 8 - th) * g_treeScroll / (float)(g_treeN - vis);
+            DrawRectangle((int)(box.x + box.width - 6), (int)ty, 4, (int)th, SHS_COLOR_BORDER);
+        }
+        if (expand >= 0) { if (g_tree[expand].open) TreeCollapse(expand); else TreeLoad(d->src, expand); }
+        else if (toggle >= 0) {
+            d->exclErr[0] = 0;
+            if (ExclStatus(d->exclude, g_tree[toggle].rel) == 2) {   /* tick it again: drop every entry that names this folder */
+                for (int i = ExclCount(d->exclude) - 1; i >= 0; i--) {
+                    char e[SHS_DEF_PATH_MAX];
+                    ExclGet(d->exclude, i, e, sizeof e);
+                    if (ExclEntryHit(e, g_tree[toggle].rel) == 2) ExclRemove(d->exclude, i);
+                }
+            } else ExclAdd(d, g_tree[toggle].rel);
+        }
+    }
+
+    const int ne = ExclCount(d->exclude);
+    char sum[64];
+    snprintf(sum, sizeof sum, ne ? "%d excluded" : "Nothing excluded", ne);
+    ShsDrawText(sum, (int)x, (int)(p.y + ph - 46), 15, SHS_COLOR_TEXT_MUTED);
+    if (ne && ButtonI((Rectangle){ x + 130, p.y + ph - 56, 100, 36 }, "Clear", SHS_ICON_CLOSE, false, false)) d->exclude[0] = 0;
+    Rectangle done = { p.x + pw - 24 - 110, p.y + ph - 56, 110, 36 };
+    if (ButtonI(done, "Done", SHS_ICON_CHECK, true, false) || IsKeyPressed(KEY_ESCAPE)) d->exclOpen = false;
+}
+
 static void DialogDraw(Dialog *d, int W, int H)
 {
+    if (d->exclOpen) { DialogExclDraw(d, W, H); return; }
     g_block = false;
     FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
 
@@ -1435,7 +1712,8 @@ static void DialogDraw(Dialog *d, int W, int H)
     const float oKeep = oMark + (showMark ? 32 + 36 : 0);
     const float oDel = oKeep + 32;
     const float rowsEnd = (d->mirror ? oKeep + 32 + (showDel ? 44 : 0) : oKeep);   /* y offset below the last option row */
-    const float pw = 640, ph = d->quick ? 372 : rowsEnd + 124;
+    const float endY = rowsEnd + (d->quick ? 0 : 40);                              /* the excluded-folders row sits under the options */
+    const float pw = 640, ph = d->quick ? 372 : endY + 124;
     Rectangle p = { (W - pw) / 2, (H - ph) / 2, pw, ph };
     if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
     else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
@@ -1446,8 +1724,7 @@ static void DialogDraw(Dialog *d, int W, int H)
         const char *swLabel = "Drag & drop folders";
         int lw = ShsMeasureText(swLabel, 14);
         Rectangle sw = { p.x + pw - 24 - 44, p.y + 22, 44, 24 };
-        ShsRoundRec(sw, 1.0f, 16, d->drag ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
-        DrawCircleV((Vector2){ sw.x + (d->drag ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
+        DrawSwitch(sw, d->drag);
         ShsDrawText(swLabel, (int)(sw.x - 12 - lw), (int)p.y + 26, 14, SHS_COLOR_TEXT_MUTED);
         Rectangle hit = { sw.x - 16 - lw, sw.y - 4, 16 + lw + 44, 32 };
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), hit)) {
@@ -1552,9 +1829,21 @@ static void DialogDraw(Dialog *d, int W, int H)
             if (ShsPickFolder("Select the folder for removed files", pick, sizeof pick)) snprintf(d->del, sizeof d->del, "%s", pick);
         }
         if (showDel && d->drag) DrawField(fDel, d->del, hint[3], d->focus == 3, SHS_ICON_NONE);
+
+        {   /* excluded folders: a summary and a button that opens the panel */
+            const int ne = ExclCount(d->exclude);
+            char sum[200] = "Excluded folders: none", fit[220];
+            if (ne) {
+                char first[SHS_DEF_PATH_MAX];
+                ExclGet(d->exclude, 0, first, sizeof first);
+                snprintf(sum, sizeof sum, ne > 1 ? "Excluded folders: %s and %d more" : "Excluded folders: %s", first, ne - 1);
+            }
+            ShsDrawText(FitTail(fit, sizeof fit, sum, 15, w - 130), (int)x, (int)(y + rowsEnd + 7), 15, SHS_COLOR_TEXT_MAIN);
+            if (ButtonI((Rectangle){ x + w - 110, y + rowsEnd + 2, 110, 32 }, "Manage", SHS_ICON_FOLDER, false, false)) { d->exclOpen = true; d->exclErr[0] = 0; d->exclIn[0] = 0; g_treeReady = false; }
+        }
     }
 
-    if (d->err[0]) ShsDrawText(d->err, (int)x, (int)y + (d->quick ? 204 : (int)rowsEnd), 15, SHS_COLOR_DANGER);
+    if (d->err[0]) ShsDrawText(d->err, (int)x, (int)y + (d->quick ? 204 : (int)endY), 15, SHS_COLOR_DANGER);
 
     Rectangle save = { p.x + pw - 24 - 110, p.y + ph - 56, 110, 36 };
     Rectangle cancel = { save.x - 118, save.y, 110, 36 };
@@ -1771,7 +2060,7 @@ int main(int argc, char **argv)
 
         if (skipDraw) {                                           /* idle: the logic above still ran; just wait for events */
             PollInputEvents();
-            ShsSleepMs(50);                                       /* not WaitTime(): raylib busy-waits at the end of it */
+            ShsSleepMs(10);                                       /* not WaitTime(): raylib busy-waits at the end of it. Short, so a quick click (press and release between two polls) is not lost: that made the close button flaky */
             continue;
         }
         BeginDrawing();
@@ -2283,8 +2572,12 @@ int main(int argc, char **argv)
         ShsDrawText(ver, W - ShsMeasureText(ver, 14) - 16, sy, 14, SHS_COLOR_TEXT_MUTED);
         if (g_updateFound) {                                                   /* newer release: click to open its page */
             char un[96];
+            const float rightEdge = (float)(W - ShsMeasureText(ver, 14) - 40);                         /* keep clear of the free-disk text / panel on the left */
+            const float leftLimit = ShsThemeBevel() ? 662.0f : 430.0f + ShsMeasureText(disk, 14) + 20.0f;
             snprintf(un, sizeof un, "Update available: %s - click to download", g_updateTag);
-            const int uw = ShsMeasureText(un, 14), ux = W - ShsMeasureText(ver, 14) - 40 - uw;
+            if (rightEdge - ShsMeasureText(un, 14) < leftLimit) snprintf(un, sizeof un, "Update available: %s", g_updateTag);
+            if (rightEdge - ShsMeasureText(un, 14) < leftLimit) snprintf(un, sizeof un, "Update %s", g_updateTag);
+            const int uw = ShsMeasureText(un, 14), ux = (int)rightEdge - uw;
             Rectangle ur = { (float)ux - 6, (float)(H - STATUSBAR_H), (float)uw + 12, STATUSBAR_H };
             bool hot = !dlg.open && CheckCollisionPointRec(GetMousePosition(), ur);
             ShsDrawText(un, ux, sy, 14, SHS_COLOR_PRIMARY);

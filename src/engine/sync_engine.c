@@ -7,6 +7,7 @@
 #endif
 #include "sync_engine.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -239,6 +240,7 @@ static bool IsTempLockName(const char *n)
    left out. Only a failure to open the top folder fails the scan. */
 static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile int *cancel, ShsSyncJob *errJob, bool deep);
 static void RecordError(ShsSyncJob *j, const char *what, const char *rel);
+static bool IsExcluded(const ShsSyncJob *j, const char *rel);
 static void RecIgnored(ShsSyncJob *j, const char *rel, uint64_t size);
 
 static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile int *cancel, ShsSyncJob *errJob, bool deep)
@@ -278,6 +280,7 @@ static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile 
         unsigned long long ft = ((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
         int64_t mt = (int64_t)(ft / 10000000ULL) - 11644473600LL;
         uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        if (errJob && isDir && IsExcluded(errJob, childRel)) continue;                                  /* excluded folder: not scanned, so not copied */
         if (errJob && !isDir && IsTempLockName(name)) { RecIgnored(errJob, childRel, sz); continue; }   /* source side only: an open document's lock file, listed but not copied */
         if (!ListPush(out, childRel, isDir ? 0 : sz, mt, isDir)) { FindClose(h); return false; }
         if (isDir && deep && !ScanDir(root, childRel, out, cancel, errJob, true)) { FindClose(h); return false; }
@@ -305,6 +308,7 @@ static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile 
         if (S_ISLNK(st.st_mode)) continue;
         bool isDir = S_ISDIR(st.st_mode);
         if (!isDir && !S_ISREG(st.st_mode)) continue;
+        if (errJob && isDir && IsExcluded(errJob, childRel)) continue;
         if (errJob && !isDir && IsTempLockName(de->d_name)) { RecIgnored(errJob, childRel, (uint64_t)st.st_size); continue; }   /* source side only: an open document's lock file */
         ok = ListPush(out, childRel, isDir ? 0 : (uint64_t)st.st_size, (int64_t)st.st_mtime, isDir);
         if (ok && isDir && deep) ok = ScanDir(root, childRel, out, cancel, errJob, true);
@@ -432,6 +436,8 @@ struct ShsSyncJob {
     bool mirror;
     char deletedDir[SHS_SYNC_PATH_MAX];    /* mirror: move removed files here (keeping their relative path) instead of deleting them; empty = delete */
     char delRel[SHS_SYNC_PATH_MAX];        /* deletedDir relative to the batch target when it lies inside it ("" otherwise): never mirrored away */
+    char excl[SHS_SYNC_EXCL_MAX][SHS_SYNC_PATH_MAX];   /* excluded folders: a bare name (any depth) or a path relative to the source, '/' separated */
+    int  nExcl;
     bool firstAdded;                      /* the first source is an added item (a folder lands in <target>/<name>) */
     bool direct;                           /* removable target: files are written under their final name (no temp + rename) */
     bool quick;                            /* Quick Copy: copy only, existing target files go through the conflict policy */
@@ -1515,6 +1521,7 @@ static void RunJob(ShsSyncJob *j)
             if (s && s->isDir == t->isDir) continue;
             if (s) continue;   /* type mismatch was handled in pass 1 */
             if (UnderRel(t->rel, j->delRel)) continue;       /* the deleted-files folder lives in the target: keep it */
+            if (IsExcluded(j, t->rel)) continue;             /* an excluded folder is left alone in the target */
             char path[SHS_SYNC_PATH_MAX * 2];
             JoinPath(path, sizeof path, j->target, t->rel);
             bool ok = t->isDir ? RemoveDirEmpty(path) : (j->deletedDir[0] ? MoveToDeleted(j, t->rel, path) : RemoveFile(path));
@@ -1654,7 +1661,36 @@ void ShsPurgeFree(ShsPurgeJob *p)
 
 /* ---- public API -------------------------------------------------------- */
 
-static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror, const char *deletedDir, bool firstAdded, bool quick, int policy)
+/* Excluded folders. `rel` is '/'-separated and relative to the batch root (source or target). A pattern without '/' matches
+   any path component; a pattern with '/' matches that path and everything below it. Case-insensitive. */
+static bool EqNoCase(const char *a, size_t n, const char *b)
+{
+    for (size_t i = 0; i < n; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return b[n] == 0;
+}
+
+static bool IsExcluded(const ShsSyncJob *j, const char *rel)
+{
+    for (int k = 0; k < j->nExcl; k++) {
+        const char *p = j->excl[k];
+        size_t pl = strlen(p);
+        if (!strchr(p, '/')) {
+            for (const char *c = rel; *c; ) {
+                const char *e = strchr(c, '/');
+                size_t cl = e ? (size_t)(e - c) : strlen(c);
+                if (cl == pl && EqNoCase(c, cl, p)) return true;
+                if (!e) break;
+                c = e + 1;
+            }
+        } else {
+            size_t rl = strlen(rel);
+            if (rl >= pl && EqNoCase(rel, pl, p) && (rl == pl || rel[pl] == '/')) return true;
+        }
+    }
+    return false;
+}
+
+static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror, const char *deletedDir, bool firstAdded, bool quick, int policy, const char *excludes)
 {
     if (!source || !target) return NULL;
     ShsSyncJob *j = (ShsSyncJob *)calloc(1, sizeof *j);
@@ -1672,6 +1708,18 @@ static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror,
         snprintf(j->deletedDir, sizeof j->deletedDir, "%s", deletedDir);
         for (char *s = j->deletedDir + strlen(j->deletedDir); s > j->deletedDir + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
     }
+    for (const char *p = excludes; p && *p && j->nExcl < SHS_SYNC_EXCL_MAX; ) {      /* "name|sub/path|..." */
+        const char *e = strchr(p, '|');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n >= SHS_SYNC_PATH_MAX) n = SHS_SYNC_PATH_MAX - 1;
+        char *d = j->excl[j->nExcl];
+        memcpy(d, p, n); d[n] = 0;
+        for (char *c = d; *c; c++) if (*c == '\\') *c = '/';
+        while (d[0] == '/' || (d[0] == '.' && d[1] == '/')) memmove(d, d + (d[0] == '/' ? 1 : 2), strlen(d));
+        for (size_t l = strlen(d); l && d[l - 1] == '/'; ) d[--l] = 0;
+        if (d[0]) j->nExcl++;
+        p = e ? e + 1 : p + n;
+    }
     MutexInit(&j->lock);
     j->st.state = SHS_SYNC_PENDING;
 
@@ -1685,10 +1733,11 @@ static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror,
     return j;
 }
 
-ShsSyncJob *ShsSyncStart(const char *source, const char *target, bool mirror)  { return StartJob(source, target, mirror, NULL, false, false, SHS_CONFLICT_SKIP); }
-ShsSyncJob *ShsSyncStartEx(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder) { return StartJob(source, target, mirror, deletedDir, intoFolder, false, SHS_CONFLICT_SKIP); }
-ShsSyncJob *ShsSyncStartQuick(const char *source, const char *target, ShsConflictAction policy) { return StartJob(source, target, false, NULL, false, true, (int)policy); }
-ShsSyncJob *ShsSyncStartItem(const char *path, const char *target, ShsConflictAction policy)    { return StartJob(path, target, false, NULL, true, true, (int)policy); }
+ShsSyncJob *ShsSyncStart(const char *source, const char *target, bool mirror)  { return StartJob(source, target, mirror, NULL, false, false, SHS_CONFLICT_SKIP, NULL); }
+ShsSyncJob *ShsSyncStartEx(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder) { return StartJob(source, target, mirror, deletedDir, intoFolder, false, SHS_CONFLICT_SKIP, NULL); }
+ShsSyncJob *ShsSyncStartExcl(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder, const char *excludes) { return StartJob(source, target, mirror, deletedDir, intoFolder, false, SHS_CONFLICT_SKIP, excludes); }
+ShsSyncJob *ShsSyncStartQuick(const char *source, const char *target, ShsConflictAction policy) { return StartJob(source, target, false, NULL, false, true, (int)policy, NULL); }
+ShsSyncJob *ShsSyncStartItem(const char *path, const char *target, ShsConflictAction policy)    { return StartJob(path, target, false, NULL, true, true, (int)policy, NULL); }
 
 void ShsSyncResolve(ShsSyncJob *j, ShsConflictAction action, bool applyToAll)
 {
