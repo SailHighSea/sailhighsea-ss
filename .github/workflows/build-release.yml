@@ -185,6 +185,9 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: SailHighSea SimpleSync ${{ needs.version.outputs.tag }}
+          # The pushed commit's message (title + description) goes first; GitHub's generated notes (PR list and the
+          # "Full Changelog" link) are appended. Direct pushes have no PRs, so without this the notes were just the link.
+          body: ${{ github.event.head_commit.message }}
           generate_release_notes: true
           prerelease: ${{ contains(needs.version.outputs.tag, '-') }}
           files: dist/*

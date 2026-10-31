@@ -7,11 +7,13 @@
 #endif
 #include "sync_engine.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -141,12 +143,22 @@ static void DbgLog(const char *fmt, ...)
 }
 
 #ifdef _WIN32
+/* UTF-8 -> UTF-16. A long absolute path ("E:\...", "\\server\share\...") gets the extended-length prefix so it is not cut off at
+   Windows' 260-character limit (deep folder trees, plus the target's own folder name, easily go past it). */
 static wchar_t *Widen(const char *s)
 {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    wchar_t *w = (wchar_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(wchar_t));
+    const size_t len = strlen(s);
+    const bool drive = len >= 200 && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z')) && s[1] == ':' && (s[2] == '\\' || s[2] == '/');
+    const bool unc   = len >= 200 && (s[0] == '\\' || s[0] == '/') && (s[1] == '\\' || s[1] == '/') && s[2] != '?' && s[2] != '.';
+    static const wchar_t P[] = L"\\\\?\\UNC\\";                               /* "\\?\" for drive paths, "\\?\UNC\" for network shares */
+    const int pre = drive ? 4 : (unc ? 8 : 0);
+    const char *body = unc ? s + 2 : s;                                       /* "\\server\share" -> "UNC\server\share" */
+    int n = MultiByteToWideChar(CP_UTF8, 0, body, -1, NULL, 0);
+    wchar_t *w = (wchar_t *)malloc((size_t)((n > 0 ? n : 1) + pre) * sizeof(wchar_t));
     if (!w) return NULL;
-    if (n <= 0 || !MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n)) w[0] = 0;
+    if (pre) wmemcpy(w, P, (size_t)pre);
+    if (n <= 0 || !MultiByteToWideChar(CP_UTF8, 0, body, -1, w + pre, n)) w[pre] = 0;
+    if (pre) for (wchar_t *c = w + pre; *c; c++) if (*c == L'/') *c = L'\\';     /* with the prefix Windows no longer accepts '/' */
     return w;
 }
 static void Narrow(const wchar_t *w, char *out, size_t cap)
@@ -209,13 +221,29 @@ static void JoinPath(char *out, size_t cap, const char *root, const char *rel)
 
 /* ---- directory scanner (Win32 / POSIX) --------------------------------- */
 
-/* Scans `root`/`rel` recursively. A subfolder that cannot be opened (e.g. "System Volume Information" on a USB stick) is
+/* Office / LibreOffice lock and scratch files ("~$Report.xlsx", "~WRL0001.tmp", ".~lock.Report.odt#"): they exist only while a
+   document is open and the application keeps them locked, so copying them always fails. Source scans leave them out. */
+static bool IsTempLockName(const char *n)
+{
+    size_t len = strlen(n);
+    if (n[0] == '~' && n[1] == '$') return true;                                   /* Word / Excel / PowerPoint owner file */
+    if (!strncmp(n, ".~lock.", 7) && len > 8 && n[len - 1] == '#') return true;    /* LibreOffice */
+    if (n[0] == '~' && len > 4) {                                                  /* ~WRL0001.tmp, ~WRD0002.tmp, ~123.tmp */
+        const char *e = n + len - 4;
+        if (e[0] == '.' && (e[1] == 't' || e[1] == 'T') && (e[2] == 'm' || e[2] == 'M') && (e[3] == 'p' || e[3] == 'P')) return true;
+    }
+    return false;
+}
+
+/* Scans `root`/`rel` (recursively when `deep`, else just its direct children). A subfolder that cannot be opened (e.g. "System Volume Information" on a USB stick) is
    skipped and logged; when `errJob` is set (the source side) it also counts as an error so the user knows files were
    left out. Only a failure to open the top folder fails the scan. */
-static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile int *cancel, ShsSyncJob *errJob);
+static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile int *cancel, ShsSyncJob *errJob, bool deep);
 static void RecordError(ShsSyncJob *j, const char *what, const char *rel);
+static bool IsExcluded(const ShsSyncJob *j, const char *rel);
+static void RecIgnored(ShsSyncJob *j, const char *rel, uint64_t size);
 
-static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile int *cancel, ShsSyncJob *errJob)
+static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile int *cancel, ShsSyncJob *errJob, bool deep)
 {
     char dirPath[SHS_SYNC_PATH_MAX];
     if (rel[0]) JoinPath(dirPath, sizeof dirPath, root, rel);
@@ -252,8 +280,10 @@ static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile 
         unsigned long long ft = ((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
         int64_t mt = (int64_t)(ft / 10000000ULL) - 11644473600LL;
         uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        if (errJob && isDir && IsExcluded(errJob, childRel)) continue;                                  /* excluded folder: not scanned, so not copied */
+        if (errJob && !isDir && IsTempLockName(name)) { RecIgnored(errJob, childRel, sz); continue; }   /* source side only: an open document's lock file, listed but not copied */
         if (!ListPush(out, childRel, isDir ? 0 : sz, mt, isDir)) { FindClose(h); return false; }
-        if (isDir && !ScanDir(root, childRel, out, cancel, errJob)) { FindClose(h); return false; }
+        if (isDir && deep && !ScanDir(root, childRel, out, cancel, errJob, true)) { FindClose(h); return false; }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return true;
@@ -278,8 +308,10 @@ static bool ScanDir(const char *root, const char *rel, EntryList *out, volatile 
         if (S_ISLNK(st.st_mode)) continue;
         bool isDir = S_ISDIR(st.st_mode);
         if (!isDir && !S_ISREG(st.st_mode)) continue;
+        if (errJob && isDir && IsExcluded(errJob, childRel)) continue;
+        if (errJob && !isDir && IsTempLockName(de->d_name)) { RecIgnored(errJob, childRel, (uint64_t)st.st_size); continue; }   /* source side only: an open document's lock file */
         ok = ListPush(out, childRel, isDir ? 0 : (uint64_t)st.st_size, (int64_t)st.st_mtime, isDir);
-        if (ok && isDir) ok = ScanDir(root, childRel, out, cancel, errJob);
+        if (ok && isDir && deep) ok = ScanDir(root, childRel, out, cancel, errJob, true);
     }
     closedir(d);
     return ok;
@@ -402,7 +434,11 @@ struct ShsSyncJob {
     char firstSource[SHS_SYNC_PATH_MAX];   /* what ShsSyncStart was given */
     char baseTarget[SHS_SYNC_PATH_MAX];    /* the target ShsSyncStart was given; added items land inside it */
     bool mirror;
-    bool firstAdded;                       /* the first source is an added item (a folder lands in <target>/<name>) */
+    char deletedDir[SHS_SYNC_PATH_MAX];    /* mirror: move removed files here (keeping their relative path) instead of deleting them; empty = delete */
+    char delRel[SHS_SYNC_PATH_MAX];        /* deletedDir relative to the batch target when it lies inside it ("" otherwise): never mirrored away */
+    char excl[SHS_SYNC_EXCL_MAX][SHS_SYNC_PATH_MAX];   /* excluded folders: a bare name (any depth) or a path relative to the source, '/' separated */
+    int  nExcl;
+    bool firstAdded;                      /* the first source is an added item (a folder lands in <target>/<name>) */
     bool direct;                           /* removable target: files are written under their final name (no temp + rename) */
     bool quick;                            /* Quick Copy: copy only, existing target files go through the conflict policy */
     volatile int policy;                   /* ShsConflictAction applied to existing target files */
@@ -467,6 +503,16 @@ static uint32_t RecAdd(ShsSyncJob *j, const char *rel, uint64_t size)
     uint32_t id = RecPushLocked(j, name, size, SHS_FILE_PENDING);
     MutexUnlock(&j->lock);
     return id;
+}
+
+/* A lock / temp file the scan left out: listed in the full file list (state SHS_FILE_IGNORED) and counted. */
+static void RecIgnored(ShsSyncJob *j, const char *rel, uint64_t size)
+{
+    char name[SHS_SYNC_PATH_MAX * 2];
+    snprintf(name, sizeof name, "%s%s", j->prefix, rel);
+    MutexLock(&j->lock);
+    if (RecPushLocked(j, name, size, SHS_FILE_IGNORED)) j->st.filesIgnored++;
+    MutexUnlock(&j->lock);
 }
 
 static void RecSetLocked(ShsSyncJob *j, uint32_t id, int state)
@@ -575,13 +621,148 @@ static bool ThreadStart(ShsThread *t, ThreadFn fn, void *arg) { return pthread_c
 static void ThreadJoin(ShsThread t) { pthread_join(t, NULL); }
 #endif
 
+/* ---- parallel folder scan ---------------------------------------------------------------------------------------------
+   Listing a big tree is one metadata call per folder, so it waits on the drive far more than it works. The first levels
+   are listed on the calling thread until there are enough folders to share out, then a few threads list the rest at the
+   same time. The lists are merged and sorted afterwards, so the order they are found in does not matter. */
+
+#define SCAN_FANOUT   8     /* share the work out once this many folders are waiting */
+#define SCAN_MAX_THR  4
+
+typedef struct {
+    const char    *root;
+    ShsSyncJob    *errJob;
+    volatile int  *cancel;
+    char         **dirs;     /* folders whose contents are not listed yet */
+    size_t         nDirs, next;
+    ShsMutex       lock;
+} ScanShared;
+
+typedef struct { ScanShared *sh; EntryList out; bool ok; } ScanWorker;
+
+THREAD_FN(ScanWorkerMain)
+{
+    ScanWorker *w = (ScanWorker *)arg;
+    ScanShared *s = w->sh;
+    w->ok = true;
+    for (;;) {
+        MutexLock(&s->lock);
+        size_t i = s->next < s->nDirs ? s->next++ : (size_t)-1;
+        MutexUnlock(&s->lock);
+        if (i == (size_t)-1 || *s->cancel) break;
+        if (!ScanDir(s->root, s->dirs[i], &w->out, s->cancel, s->errJob, true)) { w->ok = false; break; }
+    }
+    return THREAD_RESULT;
+}
+
+static void ScanFreeDirs(char **d, size_t n)
+{
+    for (size_t i = 0; i < n; i++) free(d[i]);
+    free(d);
+}
+
+/* Appends `from`'s entries to `to` (taking over their strings) and empties `from`. */
+static bool ListMove(EntryList *to, EntryList *from)
+{
+    if (from->n) {
+        if (to->n + from->n > to->cap) {
+            size_t nc = to->n + from->n;
+            Entry *nv = (Entry *)realloc(to->v, nc * sizeof(Entry));
+            if (!nv) return false;
+            to->v = nv; to->cap = nc;
+        }
+        memcpy(to->v + to->n, from->v, from->n * sizeof(Entry));
+        to->n += from->n;
+    }
+    free(from->v);
+    memset(from, 0, sizeof *from);
+    return true;
+}
+
+/* Like ScanDir(root, "", out, cancel, errJob, true), using up to `threads` threads. */
+static bool ScanParallel(const char *root, EntryList *out, volatile int *cancel, ShsSyncJob *errJob, int threads)
+{
+    if (threads > SCAN_MAX_THR) threads = SCAN_MAX_THR;
+    if (threads <= 1) return ScanDir(root, "", out, cancel, errJob, true);
+
+    char **cur = (char **)malloc(sizeof *cur);               /* folders whose children are still to be listed */
+    if (!cur) return ScanDir(root, "", out, cancel, errJob, true);
+    cur[0] = (char *)calloc(1, 1);
+    size_t nCur = cur[0] ? 1 : 0;
+    if (!nCur) { free(cur); return ScanDir(root, "", out, cancel, errJob, true); }
+
+    for (int level = 0; level < 4 && nCur > 0 && nCur < SCAN_FANOUT && !*cancel; level++) {
+        char **nxt = NULL; size_t nNxt = 0, capNxt = 0;
+        for (size_t k = 0; k < nCur; k++) {
+            size_t before = out->n;
+            if (!ScanDir(root, cur[k], out, cancel, errJob, false)) { ScanFreeDirs(cur, nCur); ScanFreeDirs(nxt, nNxt); return false; }
+            for (size_t e = before; e < out->n; e++) {
+                if (!out->v[e].isDir) continue;
+                if (nNxt == capNxt) {
+                    size_t nc = capNxt ? capNxt * 2 : 16;
+                    char **g = (char **)realloc(nxt, nc * sizeof *g);
+                    if (!g) { ScanFreeDirs(cur, nCur); ScanFreeDirs(nxt, nNxt); return false; }
+                    nxt = g; capNxt = nc;
+                }
+                char *copy = (char *)malloc(strlen(out->v[e].rel) + 1);
+                if (!copy) { ScanFreeDirs(cur, nCur); ScanFreeDirs(nxt, nNxt); return false; }
+                strcpy(copy, out->v[e].rel);
+                nxt[nNxt++] = copy;
+            }
+        }
+        ScanFreeDirs(cur, nCur);
+        cur = nxt; nCur = nNxt;
+    }
+    if (nCur == 0 || *cancel) { ScanFreeDirs(cur, nCur); return true; }
+
+    ScanShared sh = { root, errJob, cancel, cur, nCur, 0 };
+    MutexInit(&sh.lock);
+    int nThr = (int)(nCur < (size_t)threads ? nCur : (size_t)threads);
+    ScanWorker workers[SCAN_MAX_THR];
+    ShsThread th[SCAN_MAX_THR];
+    bool started[SCAN_MAX_THR];
+    for (int k = 0; k < nThr; k++) {
+        memset(&workers[k], 0, sizeof workers[k]);
+        workers[k].sh = &sh;
+        workers[k].ok = true;
+        started[k] = k > 0 && ThreadStart(&th[k], ScanWorkerMain, &workers[k]);
+    }
+    ScanWorkerMain(&workers[0]);                            /* this thread works too */
+    for (int k = 1; k < nThr; k++) {
+        if (started[k]) ThreadJoin(th[k]);
+        else            ScanWorkerMain(&workers[k]);        /* could not start it: run its share here */
+    }
+    bool ok = true;
+    for (int k = 0; k < nThr; k++) {
+        if (!workers[k].ok) ok = false;
+        if (!ListMove(out, &workers[k].out)) ok = false;
+        ListFree(&workers[k].out);
+    }
+    MutexDestroy(&sh.lock);
+    ScanFreeDirs(cur, nCur);
+    return ok;
+}
+
+typedef struct { const char *root; EntryList list; volatile int *cancel; int threads; bool ok; int err; } TargetScan;
+
+THREAD_FN(TargetScanMain)
+{
+    TargetScan *t = (TargetScan *)arg;
+    t->ok = ScanParallel(t->root, &t->list, t->cancel, NULL, t->threads);
+    t->err = t_scanErr;
+    return THREAD_RESULT;
+}
+
 typedef struct {
     const Entry   *e;
     char          *dstRel;   /* target path when it differs from e->rel (Keep both), else NULL; freed by RunJob */
     uint32_t       id;
+    bool           fresh;    /* nothing exists at the target path: a partial file can safely be left behind and removed on failure */
     unsigned char *buf;      /* whole file when it was read ahead, else NULL (streamed by the writer) */
     size_t         len;
 } CopyItem;
+
+#define SMALL_DIRECT (1u << 20)   /* new files up to this size are written straight to their final name (no temp file + rename) */
 
 typedef struct {
     ShsSyncJob *j;
@@ -597,7 +778,8 @@ typedef struct {
     int         bigLimit, bigActive;/* how many large files may stream at once (see SameVolume) */
 } Pipe;
 
-#define BIG_FILE (16u << 20)        /* files above this stream in large blocks; their concurrency is limited */
+#define REMOVABLE_WRITERS 3         /* parallel writers on a removable target (small files; big ones are limited to one) */
+#define BIG_FILE (16u << 20)       /* files above this stream in large blocks; their concurrency is limited */
 
 /* True when both folders live on the same volume / device. Large files copied in parallel on one disk only fight
    over the same heads or flash channels, so there they are copied one at a time. */
@@ -779,7 +961,8 @@ static int CopyFileItem(ShsSyncJob *j, CopyItem *it)
     char src[SHS_SYNC_PATH_MAX * 2], dst[SHS_SYNC_PATH_MAX * 2], tmp[SHS_SYNC_PATH_MAX * 2 + 16];
     JoinPath(src, sizeof src, j->source, e->rel);
     JoinPath(dst, sizeof dst, j->target, it->dstRel ? it->dstRel : e->rel);
-    if (j->direct) snprintf(tmp, sizeof tmp, "%s", dst);          /* removable target: write the final name, skip the rename */
+    const bool direct = j->direct || (it->fresh && e->size <= SMALL_DIRECT);
+    if (direct) snprintf(tmp, sizeof tmp, "%s", dst);             /* removable target, or a small new file: write the final name, skip the rename */
     else           snprintf(tmp, sizeof tmp, "%s.shs-tmp", dst);
 
     const bool verify = j->verify != 0;           /* decided per file, when it starts */
@@ -909,7 +1092,7 @@ static int CopyFileItem(ShsSyncJob *j, CopyItem *it)
         if (j->skipId == (int)it->id) j->skipId = 0;
     }
 
-    if (ok && !j->direct) ok = FsReplace(tmp, dst);
+    if (ok && !direct) ok = FsReplace(tmp, dst);
     if (ok && !mtimeDone) SetMtime(dst, e->mtime);
     if (!ok) RemoveFile(tmp);
     RecentFinish(j, it->id, ok);
@@ -987,13 +1170,14 @@ static void RunCopies(ShsSyncJob *j, CopyItem *items, size_t n)
 
     int threads = g_cfgThreads;
     j->direct = TargetIsRemovable(j->target);
-    if (j->direct && threads > 1) {            /* a USB stick is one slow flash device: parallel writers only slow it down */
-        DbgLog("target is a removable drive: using 1 writer instead of %d", threads);
-        threads = 1;
+    if (j->direct && threads > REMOVABLE_WRITERS) {   /* a USB stick answers every create/close slowly: a few writers overlap that wait, many make it seek */
+        DbgLog("target is a removable drive: using %d writers instead of %d", REMOVABLE_WRITERS, threads);
+        threads = REMOVABLE_WRITERS;
     }
     if ((size_t)threads > n) threads = (int)n;
     if (threads < 1) threads = 1;
-    p.bigLimit = SameVolume(j->source, j->target) ? 1 : (threads < 3 ? threads : 3);
+    p.bigLimit = (j->direct || SameVolume(j->source, j->target)) ? 1 : (threads < 3 ? threads : 3);   /* big files stream one at a time on a stick */
+    const double t0 = NowSeconds();
 
     ShsThread reader, writers[MAX_COPY_THREADS];
     bool readerStarted = false;
@@ -1006,6 +1190,9 @@ static void RunCopies(ShsSyncJob *j, CopyItem *items, size_t n)
 
     for (int k = 0; k < started; k++) ThreadJoin(writers[k]);
     if (readerStarted) ThreadJoin(reader);
+
+    const double secs = NowSeconds() - t0;
+    DbgLog("copy pass: %zu file(s) in %.1f s (%.0f files/s) with %d writer(s)", n, secs, secs > 0 ? (double)n / secs : 0.0, threads);
 
     for (size_t i = 0; i < n; i++) ReleaseItem(&p, &items[i]);      /* anything left after a cancel */
     MutexDestroy(&p.lock);
@@ -1081,6 +1268,7 @@ static bool SetupBatch(ShsSyncJob *j, const char *path, bool added)
             name[k] = 0;
             if (!name[0]) snprintf(name, sizeof name, "Copy");
             JoinPath(j->target, sizeof j->target, j->baseTarget, name);
+            j->batchMirror = j->mirror;                              /* only ever true for a sync task (Quick Copy never mirrors) */
             snprintf(j->prefix, sizeof j->prefix, "%s/", name);
         } else {
             snprintf(j->target, sizeof j->target, "%s", j->baseTarget);
@@ -1149,6 +1337,71 @@ static char *UniqueRel(const ShsSyncJob *j, const char *rel)
     return NULL;
 }
 
+/* Mirror with a "deleted files" folder: moves `from` (a file in the target) to <deletedDir>/<rel>. A file already there keeps
+   its place; the newcomer gets ".deleted-<time>" appended. */
+static bool MoveToDeleted(const ShsSyncJob *j, const char *rel, const char *from)
+{
+    char to[SHS_SYNC_PATH_MAX * 2], dir[SHS_SYNC_PATH_MAX * 2];
+    JoinPath(to, sizeof to, j->deletedDir, rel);
+    snprintf(dir, sizeof dir, "%s", to);
+    char *cut = NULL;
+    for (char *c = dir; *c; c++) if (*c == '/' || *c == '\\') cut = c;
+    if (cut) { *cut = 0; if (!MakeDirs(dir)) return false; }
+
+    uint64_t sz; int64_t mt; bool isDir;
+    for (int n = 0; StatPath(to, &sz, &mt, &isDir) && n < 1000; n++) {
+        JoinPath(to, sizeof to, j->deletedDir, rel);
+        size_t len = strlen(to);
+        snprintf(to + len, sizeof to - len, ".deleted-%lld-%d", (long long)time(NULL), n);
+    }
+#ifdef _WIN32
+    wchar_t *a = Widen(from), *b = Widen(to);
+    BOOL ok = (a && b) ? MoveFileExW(a, b, MOVEFILE_COPY_ALLOWED) : FALSE;
+    free(a); free(b);
+    return ok != 0;
+#else
+    return rename(from, to) == 0;
+#endif
+}
+
+/* The folder `deleted` relative to `target` with '/' separators, when it lies inside it; empty otherwise. */
+static void RelInside(char *out, size_t cap, const char *target, const char *deleted)
+{
+    out[0] = 0;
+    size_t tl = strlen(target);
+    while (tl && (target[tl - 1] == '/' || target[tl - 1] == '\\')) tl--;
+    if (!tl || !deleted[0]) return;
+    for (size_t i = 0; i < tl; i++) {
+        char a = target[i], b = deleted[i];
+        if (!b) return;
+        if (a == '\\') a = '/';
+        if (b == '\\') b = '/';
+#ifdef _WIN32
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+#endif
+        if (a != b) return;
+    }
+    if (deleted[tl] != '/' && deleted[tl] != '\\') return;
+    snprintf(out, cap, "%s", deleted + tl + 1);
+    size_t n = strlen(out);
+    while (n && (out[n - 1] == '/' || out[n - 1] == '\\')) out[--n] = 0;
+    for (char *c = out; *c; c++) if (*c == '\\') *c = '/';
+}
+
+/* True for the folder `base` itself and anything below it. */
+static bool UnderRel(const char *rel, const char *base)
+{
+    size_t n = strlen(base);
+    if (!n) return false;
+#ifdef _WIN32
+    if (_strnicmp(rel, base, n) != 0) return false;
+#else
+    if (strncmp(rel, base, n) != 0) return false;
+#endif
+    return rel[n] == 0 || rel[n] == '/' || rel[n] == '\\';
+}
+
 static void RunJob(ShsSyncJob *j)
 {
     EntryList src = {0}, dst = {0};
@@ -1164,13 +1417,23 @@ static void RunJob(ShsSyncJob *j)
         if (StatPath(sp, &sz, &mt, &isDir)) ListPush(&src, j->onlyName, sz, mt, false);
         if (StatPath(tp, &sz, &mt, &isDir)) ListPush(&dst, j->onlyName, isDir ? 0 : sz, mt, isDir);
     } else {
-        if (!ScanDir(j->source, "", &src, &j->cancel, j) && !j->cancel) {
-            char what[64]; snprintf(what, sizeof what, "Cannot read source (error %d)", t_scanErr);
+        /* Scan the source and the target at the same time, each with a few threads (one on a removable drive). */
+        const int srcThr = TargetIsRemovable(j->source) ? 1 : SCAN_MAX_THR, dstThr = TargetIsRemovable(j->target) ? 1 : SCAN_MAX_THR;
+        TargetScan ts; memset(&ts, 0, sizeof ts);
+        ts.root = j->target; ts.cancel = &j->cancel; ts.threads = dstThr;
+        ShsThread tsThread;
+        bool tsStarted = ThreadStart(&tsThread, TargetScanMain, &ts);
+        bool srcOk = ScanParallel(j->source, &src, &j->cancel, j, srcThr);
+        int srcErr = t_scanErr;
+        if (tsStarted) ThreadJoin(tsThread); else TargetScanMain(&ts);
+        dst = ts.list;
+        if (!srcOk && !j->cancel) {
+            char what[64]; snprintf(what, sizeof what, "Cannot read source (error %d)", srcErr);
             RecordError(j, what, j->source);
-            ListFree(&src); return;
+            ListFree(&src); ListFree(&dst); return;
         }
-        if (!ScanDir(j->target, "", &dst, &j->cancel, NULL) && !j->cancel) {
-            char what[64]; snprintf(what, sizeof what, "Cannot read target (error %d)", t_scanErr);
+        if (!ts.ok && !j->cancel) {
+            char what[64]; snprintf(what, sizeof what, "Cannot read target (error %d)", ts.err);
             RecordError(j, what, j->target);
             ListFree(&src); ListFree(&dst); return;
         }
@@ -1226,6 +1489,7 @@ static void RunJob(ShsSyncJob *j)
         if (!WillCopy(s, t, act ? act[i] : 0, j->quick)) continue;
         if (t && t->isDir) { RecordError(j, "Folder blocks file", s->rel); continue; }
         items[nItems].e = s;
+        items[nItems].fresh = !t || (act && (act[i] == SHS_CONFLICT_KEEP_BOTH || act[i] == SHS_CONFLICT_RENAME_TARGET));
         if (act && act[i] == SHS_CONFLICT_KEEP_BOTH) {
             items[nItems].dstRel = UniqueRel(j, s->rel);
             DbgLog("keep both: %s will be copied as %s", s->rel, items[nItems].dstRel ? items[nItems].dstRel : "(no free name)");
@@ -1250,15 +1514,21 @@ static void RunJob(ShsSyncJob *j)
     free(act);
     /* Pass 2 (mirror): delete target items missing from source, children first. */
     if (j->batchMirror && !j->cancel) {
+        RelInside(j->delRel, sizeof j->delRel, j->target, j->deletedDir);
         for (size_t i = dst.n; i-- > 0 && Checkpoint(j); ) {
             const Entry *t = &dst.v[i];
             const Entry *s = ListFind(&src, t->rel);
             if (s && s->isDir == t->isDir) continue;
             if (s) continue;   /* type mismatch was handled in pass 1 */
+            if (UnderRel(t->rel, j->delRel)) continue;       /* the deleted-files folder lives in the target: keep it */
+            if (IsExcluded(j, t->rel)) continue;             /* an excluded folder is left alone in the target */
             char path[SHS_SYNC_PATH_MAX * 2];
             JoinPath(path, sizeof path, j->target, t->rel);
-            bool ok = t->isDir ? RemoveDirEmpty(path) : RemoveFile(path);
-            if (ok) { MutexLock(&j->lock); j->st.filesDeleted++; MutexUnlock(&j->lock); if (!t->isDir) RecentPush(j, t->rel, t->size, SHS_FILE_REMOVED, 0); }
+            bool ok = t->isDir ? RemoveDirEmpty(path) : (j->deletedDir[0] ? MoveToDeleted(j, t->rel, path) : RemoveFile(path));
+            if (ok) {
+                MutexLock(&j->lock); j->st.filesDeleted++; MutexUnlock(&j->lock);
+                if (!t->isDir) RecentPush(j, t->rel, t->size, SHS_FILE_REMOVED, RecAdd(j, t->rel, t->size));   /* also listed in the full file list */
+            }
             else    RecordError(j, "Delete failed", t->rel);
         }
     }
@@ -1299,9 +1569,128 @@ static DWORD WINAPI WorkerMain(LPVOID p) { RunAll((ShsSyncJob *)p); return 0; }
 static void *WorkerMain(void *p) { RunAll((ShsSyncJob *)p); return NULL; }
 #endif
 
+/* ---- purge: delete what a task copied into its target ------------------------------------------------------------ */
+
+/* The folder name an added folder gets inside the target ("D:\Work\Photos" -> "Photos", a drive root "D:" -> "D"). */
+static void AddedFolderName(const char *path, char *name, size_t cap)
+{
+    char clean[SHS_SYNC_PATH_MAX];
+    snprintf(clean, sizeof clean, "%s", path);
+    for (char *s = clean + strlen(clean); s > clean + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
+    const char *base = BaseNameOf(clean);
+    size_t k = 0;
+    for (const char *c = base; *c && k + 1 < cap; c++) if (*c != ':' && *c != '/' && *c != '\\') name[k++] = *c;
+    name[k] = 0;
+    if (!name[0]) snprintf(name, cap, "Copy");
+}
+
+struct ShsPurgeJob {
+    char source[SHS_SYNC_PATH_MAX];
+    char target[SHS_SYNC_PATH_MAX];      /* the folder to clean: <target>/<name> (whole = true) or the task's target */
+    bool whole;                          /* the folder belongs to the task: remove all of it, not just what the source has */
+    ShsThread thread;
+    bool      threadStarted;
+    volatile uint64_t deleted, failed;
+    volatile int done, cancel;
+};
+
+THREAD_FN(PurgeMain)
+{
+    ShsPurgeJob *p = (ShsPurgeJob *)arg;
+    EntryList src = {0}, dst = {0};
+    bool ok = ScanParallel(p->target, &dst, &p->cancel, NULL, 4);
+    if (ok && !p->whole) ok = ScanParallel(p->source, &src, &p->cancel, NULL, 4);
+    if (!ok) {
+        if (!p->cancel) p->failed++;                               /* a folder could not be listed: nothing is deleted */
+    } else {
+        qsort(dst.v, dst.n, sizeof(Entry), EntryCmp);
+        qsort(src.v, src.n, sizeof(Entry), EntryCmp);
+        for (size_t i = dst.n; i-- > 0 && !p->cancel; ) {         /* children before their folders */
+            const Entry *t = &dst.v[i];
+            if (!p->whole) {
+                const Entry *s = ListFind(&src, t->rel);
+                if (!s || s->isDir != t->isDir) continue;         /* not something this task copied */
+            }
+            char path[SHS_SYNC_PATH_MAX * 2];
+            JoinPath(path, sizeof path, p->target, t->rel);
+            if (t->isDir) { RemoveDirEmpty(path); continue; }     /* only succeeds once it is empty; leftovers of other tasks stay */
+            if (RemoveFile(path)) p->deleted++; else p->failed++;
+        }
+        if (p->whole && !p->cancel) RemoveDirEmpty(p->target);
+    }
+    ListFree(&src); ListFree(&dst);
+    p->done = 1;
+    return THREAD_RESULT;
+}
+
+ShsPurgeJob *ShsPurgeStart(const char *source, const char *target, bool includeFolder)
+{
+    if (!source || !target || !source[0] || !target[0]) return NULL;
+    ShsPurgeJob *p = (ShsPurgeJob *)calloc(1, sizeof *p);
+    if (!p) return NULL;
+    snprintf(p->source, sizeof p->source, "%s", source);
+    snprintf(p->target, sizeof p->target, "%s", target);
+    for (char *s = p->source + strlen(p->source); s > p->source + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
+    for (char *s = p->target + strlen(p->target); s > p->target + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
+    if (includeFolder) {
+        char name[SHS_SYNC_PATH_MAX], full[SHS_SYNC_PATH_MAX];
+        AddedFolderName(p->source, name, sizeof name);
+        JoinPath(full, sizeof full, p->target, name);
+        snprintf(p->target, sizeof p->target, "%s", full);
+        p->whole = true;
+    }
+    p->threadStarted = ThreadStart(&p->thread, PurgeMain, p);
+    if (!p->threadStarted) { free(p); return NULL; }
+    return p;
+}
+
+bool ShsPurgeStatus(ShsPurgeJob *p, uint64_t *deleted, uint64_t *failed)
+{
+    if (deleted) *deleted = p->deleted;
+    if (failed)  *failed = p->failed;
+    return p->done != 0;
+}
+
+void ShsPurgeFree(ShsPurgeJob *p)
+{
+    if (!p) return;
+    p->cancel = 1;
+    if (p->threadStarted) ThreadJoin(p->thread);
+    free(p);
+}
+
 /* ---- public API -------------------------------------------------------- */
 
-static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror, bool firstAdded, bool quick, int policy)
+/* Excluded folders. `rel` is '/'-separated and relative to the batch root (source or target). A pattern without '/' matches
+   any path component; a pattern with '/' matches that path and everything below it. Case-insensitive. */
+static bool EqNoCase(const char *a, size_t n, const char *b)
+{
+    for (size_t i = 0; i < n; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return b[n] == 0;
+}
+
+static bool IsExcluded(const ShsSyncJob *j, const char *rel)
+{
+    for (int k = 0; k < j->nExcl; k++) {
+        const char *p = j->excl[k];
+        size_t pl = strlen(p);
+        if (!strchr(p, '/')) {
+            for (const char *c = rel; *c; ) {
+                const char *e = strchr(c, '/');
+                size_t cl = e ? (size_t)(e - c) : strlen(c);
+                if (cl == pl && EqNoCase(c, cl, p)) return true;
+                if (!e) break;
+                c = e + 1;
+            }
+        } else {
+            size_t rl = strlen(rel);
+            if (rl >= pl && EqNoCase(rel, pl, p) && (rl == pl || rel[pl] == '/')) return true;
+        }
+    }
+    return false;
+}
+
+static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror, const char *deletedDir, bool firstAdded, bool quick, int policy, const char *excludes)
 {
     if (!source || !target) return NULL;
     ShsSyncJob *j = (ShsSyncJob *)calloc(1, sizeof *j);
@@ -1315,6 +1704,22 @@ static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror,
     for (char *s = j->firstSource + strlen(j->firstSource); s > j->firstSource + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
     for (char *s = j->baseTarget + strlen(j->baseTarget); s > j->baseTarget + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
     j->mirror = mirror;
+    if (deletedDir && deletedDir[0]) {
+        snprintf(j->deletedDir, sizeof j->deletedDir, "%s", deletedDir);
+        for (char *s = j->deletedDir + strlen(j->deletedDir); s > j->deletedDir + 1 && (s[-1] == '/' || s[-1] == '\\'); ) *--s = 0;
+    }
+    for (const char *p = excludes; p && *p && j->nExcl < SHS_SYNC_EXCL_MAX; ) {      /* "name|sub/path|..." */
+        const char *e = strchr(p, '|');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n >= SHS_SYNC_PATH_MAX) n = SHS_SYNC_PATH_MAX - 1;
+        char *d = j->excl[j->nExcl];
+        memcpy(d, p, n); d[n] = 0;
+        for (char *c = d; *c; c++) if (*c == '\\') *c = '/';
+        while (d[0] == '/' || (d[0] == '.' && d[1] == '/')) memmove(d, d + (d[0] == '/' ? 1 : 2), strlen(d));
+        for (size_t l = strlen(d); l && d[l - 1] == '/'; ) d[--l] = 0;
+        if (d[0]) j->nExcl++;
+        p = e ? e + 1 : p + n;
+    }
     MutexInit(&j->lock);
     j->st.state = SHS_SYNC_PENDING;
 
@@ -1328,9 +1733,11 @@ static ShsSyncJob *StartJob(const char *source, const char *target, bool mirror,
     return j;
 }
 
-ShsSyncJob *ShsSyncStart(const char *source, const char *target, bool mirror)  { return StartJob(source, target, mirror, false, false, SHS_CONFLICT_SKIP); }
-ShsSyncJob *ShsSyncStartQuick(const char *source, const char *target, ShsConflictAction policy) { return StartJob(source, target, false, false, true, (int)policy); }
-ShsSyncJob *ShsSyncStartItem(const char *path, const char *target, ShsConflictAction policy)    { return StartJob(path, target, false, true, true, (int)policy); }
+ShsSyncJob *ShsSyncStart(const char *source, const char *target, bool mirror)  { return StartJob(source, target, mirror, NULL, false, false, SHS_CONFLICT_SKIP, NULL); }
+ShsSyncJob *ShsSyncStartEx(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder) { return StartJob(source, target, mirror, deletedDir, intoFolder, false, SHS_CONFLICT_SKIP, NULL); }
+ShsSyncJob *ShsSyncStartExcl(const char *source, const char *target, bool mirror, const char *deletedDir, bool intoFolder, const char *excludes) { return StartJob(source, target, mirror, deletedDir, intoFolder, false, SHS_CONFLICT_SKIP, excludes); }
+ShsSyncJob *ShsSyncStartQuick(const char *source, const char *target, ShsConflictAction policy) { return StartJob(source, target, false, NULL, false, true, (int)policy, NULL); }
+ShsSyncJob *ShsSyncStartItem(const char *path, const char *target, ShsConflictAction policy)    { return StartJob(path, target, false, NULL, true, true, (int)policy, NULL); }
 
 void ShsSyncResolve(ShsSyncJob *j, ShsConflictAction action, bool applyToAll)
 {

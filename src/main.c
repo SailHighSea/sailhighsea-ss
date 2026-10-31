@@ -6,6 +6,7 @@
 #include "engine/sync_engine.h"
 #include "engine/task_store.h"
 #include "platform/platform.h"
+#include "platform/updater.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -21,7 +22,7 @@
 #endif
 #define TITLEBAR_H      48
 #define STATUSBAR_H     30
-#define SIDEBAR_W       220
+#define SIDEBAR_W       64      /* icon rail */
 #define BTN_W           46
 #define MAX_TASKS       64
 
@@ -61,6 +62,11 @@ typedef struct {
     bool           pending;      /* a change was seen; sync once the folder has been quiet for a moment */
     double         lastChange;   /* when the last change was seen */
     double         nextWatchTry; /* retry time if the source folder could not be watched */
+    bool           usbSeen;      /* USB sync: the target's drive was connected at the last poll (valid once usbInit is set) */
+    bool           usbInit;
+    double         nextUsbPoll;
+    double         usbSyncAt;    /* USB sync: when to start after the drive appeared (0 = nothing waiting) */
+    char           runTarget[SHS_DEF_PATH_MAX];   /* the target the current / last run used (a USB task may have moved to another drive letter) */
     bool           failed;       /* last run ended with errors */
     char           resultMsg[SHS_TASK_MSG_MAX];
 
@@ -87,10 +93,19 @@ typedef struct {
     char name[SHS_DEF_NAME_MAX], src[SHS_DEF_PATH_MAX], dst[SHS_DEF_PATH_MAX];
     bool mirror;
     bool autoSync;
-    int  focus;                            /* 0 name, 1 source, 2 target */
+    bool usbSync;                          /* sync when the target's drive is connected */
+    bool usbMark;                          /* USB sync: write the hidden .simplesync-id file into the target to recognise this stick */
+    bool includeFolder;                    /* copy the source folder itself, not just its contents */
+    bool keepDeleted;                      /* mirror: move removed files to `del` instead of deleting them */
+    char del[SHS_DEF_PATH_MAX];
+    int  focus;                            /* 0 name, 1 source, 2 target, 3 deleted-files folder */
     bool drag;                             /* drag & drop zones instead of the folder text fields */
     bool quick;                            /* Quick Copy: one-off copy, nothing saved */
     char err[120];
+    char exclude[1024];                    /* excluded source folders, '|' separated (see ShsSyncStartExcl) */
+    char exclIn[SHS_DEF_PATH_MAX];         /* text being typed in the excluded-folders panel */
+    char exclErr[120];
+    bool exclOpen;                         /* the excluded-folders panel replaces the dialog */
 } Dialog;
 
 static bool      g_autostart = false;        /* registered to start with the system (read from the OS) */
@@ -101,9 +116,17 @@ static bool      g_quickVerify = false;      /* Quick Copy: verify copied files 
 static bool      g_quickUnattended = false;  /* Quick Copy: dismiss the card by itself when the copy finishes */
 static int       g_copyThreads = 4;          /* files copied in parallel (1..16) */
 static int       g_copyBufMiB = 64;          /* read-ahead buffer for small files, MiB (0 = off) */
+static bool      g_checkUpdates = false;     /* look for a newer release on GitHub at start-up and once a day */
+static bool      g_updateDev = false;        /* ...and also tell about dev (pre-release) builds */
+static double    g_nextUpdateCheck = 0;      /* GetTime() of the next automatic check */
+static bool      g_updateFound = false;      /* a newer release exists: shown in the status bar */
+static char      g_updateTag[64], g_updateUrl[256];
+static char      g_updateMsg[96];            /* result of the last check, shown in Settings */
+static float     g_setScroll = 0, g_setMax = 0;   /* Settings page scroll offset and the most it can scroll */
 static bool      g_hidden = false;           /* window currently hidden in the tray */
 static bool      g_launchedHidden = false;   /* started with --minimized */
 static bool      g_multi = false;            /* started with --multi (testing): must not touch the start-up entry */
+static bool      g_restart = false;          /* theme switch: start a fresh copy after closing */
 static float     g_winR = 12.0f;             /* window corner radius; 0 when maximized */
 static Texture2D g_logo;
 static Texture2D g_logoGray;               /* grey copy of the logo, shown on paused tasks */                   /* title bar logo, from the embedded icon */
@@ -238,7 +261,7 @@ static float RoundNess(Rectangle r, float radius)
 static void FillRound(Rectangle r, float radius, Color c)
 {
     if (radius < 0.5f) DrawRectangleRec(r, c);
-    else               DrawRectangleRounded(r, RoundNess(r, radius), 16, c);
+    else               ShsRoundRec(r, RoundNess(r, radius), 16, c);
 }
 
 /* Rounded on top only (title bar) / bottom only (status bar). */
@@ -261,7 +284,7 @@ static bool ButtonI(Rectangle r, const char *label, ShsIcon icon, bool primary, 
     bool hot = CheckCollisionPointRec(Mouse(), r);
     Color bg = primary ? (hot ? SHS_COLOR_PRIMARY_HOVER : SHS_COLOR_PRIMARY)
                        : (active ? SHS_COLOR_PRIMARY : (hot ? SHS_COLOR_CARD_HOVER : SHS_COLOR_CARD));
-    ShsDrawRoundedBox(r, 9.0f, bg, (primary || active) ? bg : SHS_COLOR_BORDER);
+    ShsDrawButtonBox(r, 9.0f, bg, (primary || active) ? bg : SHS_COLOR_BORDER, active || (hot && !g_block && IsMouseButtonDown(MOUSE_BUTTON_LEFT)));
     Color ink = (primary || active) ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN;
 
     int tw = ShsMeasureText(label, 15);
@@ -302,19 +325,20 @@ static void HandleTyping(char *buf, size_t cap)
 
 static void DrawFieldEx(Rectangle r, const char *text, const char *placeholder, bool focused, ShsIcon icon, bool onTitle)
 {
-    const Color ink    = onTitle ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN;
-    const Color muted  = onTitle ? Fade(SHS_COLOR_ON_PRIMARY, 0.65f) : SHS_COLOR_TEXT_MUTED;
+    const bool tint = onTitle && !ShsThemeClassic();         /* retro themes keep a white field with dark text on the title bar */
+    const Color ink    = tint ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN;
+    const Color muted  = tint ? Fade(SHS_COLOR_ON_PRIMARY, 0.65f) : SHS_COLOR_TEXT_MUTED;
     const float round  = onTitle ? 0.5f : 0.25f;
     (void)round;
-    if (onTitle) {
-        DrawRectangleRounded(r, 0.5f, 16, Fade(SHS_COLOR_ON_PRIMARY, focused ? 0.20f : 0.12f));
-        if (focused) DrawRectangleRoundedLinesEx(r, 0.5f, 16, 1.5f, Fade(SHS_COLOR_ON_PRIMARY, 0.75f));
+    if (tint) {
+        ShsRoundRec(r, 0.5f, 16, Fade(SHS_COLOR_ON_PRIMARY, focused ? 0.20f : 0.12f));
+        if (focused) ShsRoundLines(r, 0.5f, 16, 1.5f, Fade(SHS_COLOR_ON_PRIMARY, 0.75f));
     } else {
-        ShsDrawRoundedBox(r, 9.0f, SHS_COLOR_BG, focused ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
+        ShsDrawRoundedBox(r, 9.0f, ShsThemeClassic() ? SHS_COLOR_CARD : SHS_COLOR_BG, focused ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
     }
     const int pad = icon != SHS_ICON_NONE ? 38 : 12;
     if (icon != SHS_ICON_NONE)
-        ShsDrawIcon(icon, r.x + 20, r.y + r.height / 2, 16.0f, onTitle ? ink : (focused ? SHS_COLOR_PRIMARY : muted));
+        ShsDrawIcon(icon, r.x + 20, r.y + r.height / 2, 16.0f, tint ? ink : (focused ? SHS_COLOR_PRIMARY : muted));
     const char *p = text;
     while (*p && ShsMeasureText(p, 15) > (int)r.width - pad - 12) {    /* keep the tail visible */
         p++;
@@ -334,7 +358,7 @@ static void DrawField(Rectangle r, const char *text, const char *placeholder, bo
 
 /* ---- persistence -------------------------------------------------------- */
 
-/* Settings file, one "key=value" per line: theme=auto|light|dark, startHidden=0|1, closeToTray=0|1, dragDialog=0|1, copyThreads=N, copyBufMB=N, quickVerify=0|1, quickUnattended=0|1.
+/* Settings file, one "key=value" per line: theme=auto|light|dark, startHidden=0|1, closeToTray=0|1, dragDialog=0|1, copyThreads=N, copyBufMB=N, quickVerify=0|1, quickUnattended=0|1, checkUpdates=0|1, updateDev=0|1.
    Whether the program starts with the system is read back from the OS, not stored here. */
 static void SaveSettings(void)
 {
@@ -343,9 +367,9 @@ static void SaveSettings(void)
     FILE *f = fopen(path, "wb");
     if (!f) return;
     ShsThemeMode m = ShsThemeGetMode();
-    fprintf(f, "theme=%s\nstartHidden=%d\ncloseToTray=%d\ndragDialog=%d\ncopyThreads=%d\ncopyBufMB=%d\nquickVerify=%d\nquickUnattended=%d\n",
-            m == SHS_THEME_LIGHT ? "light" : (m == SHS_THEME_DARK ? "dark" : "auto"), g_startHidden ? 1 : 0, g_closeToTray ? 1 : 0,
-            g_dragDialog ? 1 : 0, g_copyThreads, g_copyBufMiB, g_quickVerify ? 1 : 0, g_quickUnattended ? 1 : 0);
+    fprintf(f, "theme=%s\nstartHidden=%d\ncloseToTray=%d\ndragDialog=%d\ncopyThreads=%d\ncopyBufMB=%d\nquickVerify=%d\nquickUnattended=%d\ncheckUpdates=%d\nupdateDev=%d\n",
+            ShsThemeName(m), g_startHidden ? 1 : 0, g_closeToTray ? 1 : 0,
+            g_dragDialog ? 1 : 0, g_copyThreads, g_copyBufMiB, g_quickVerify ? 1 : 0, g_quickUnattended ? 1 : 0, g_checkUpdates ? 1 : 0, g_updateDev ? 1 : 0);
     fclose(f);
 }
 
@@ -356,13 +380,18 @@ static void LoadSettings(void)
     AppPath(path, sizeof path, "simplesync-settings.txt");
     FILE *f = fopen(path, "rb");
     while (f && fgets(line, sizeof line, f)) {
-        if (strstr(line, "theme=light"))          mode = SHS_THEME_LIGHT;
-        else if (strstr(line, "theme=dark"))      mode = SHS_THEME_DARK;
+        if (!strncmp(line, "theme=", 6)) {
+            char nm[32] = "";
+            sscanf(line + 6, "%31[a-z0-9]", nm);
+            mode = ShsThemeFromName(nm);
+        }
         else if (strstr(line, "startHidden=1"))   g_startHidden = true;
         else if (strstr(line, "closeToTray=1"))   g_closeToTray = true;
         else if (strstr(line, "dragDialog=1"))    g_dragDialog = true;
         else if (strstr(line, "quickVerify=1"))     g_quickVerify = true;
         else if (strstr(line, "quickUnattended=1")) g_quickUnattended = true;
+        else if (strstr(line, "checkUpdates=1"))    g_checkUpdates = true;
+        else if (strstr(line, "updateDev=1"))       g_updateDev = true;
         else if (!strncmp(line, "copyThreads=", 12)) g_copyThreads = atoi(line + 12);
         else if (!strncmp(line, "copyBufMB=", 10))   g_copyBufMiB = atoi(line + 10);
     }
@@ -420,13 +449,14 @@ static bool Stepper(float x, float y, const char *label, int *value, int lo, int
     return changed;
 }
 
+static void DrawSwitch(Rectangle sw, bool on);
+
 /* Settings-page switch: label + hint, returns true when clicked (and flips *value). */
 static bool Toggle(float x, float y, float w, const char *label, const char *hint, bool *value)
 {
     Rectangle row = { x, y, w, 46 };
     Rectangle sw = { x, y + 3, 44, 24 };
-    DrawRectangleRounded(sw, 1.0f, 16, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
-    DrawCircleV((Vector2){ sw.x + (*value ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
+    DrawSwitch(sw, *value);
     ShsDrawText(label, (int)x + 58, (int)y + 1, 16, SHS_COLOR_TEXT_MAIN);
     ShsDrawText(hint, (int)x + 58, (int)y + 23, 13, SHS_COLOR_TEXT_MUTED);
     if (CheckCollisionPointRec(Mouse(), row) && Pressed()) { *value = !*value; return true; }
@@ -452,13 +482,91 @@ static void LoadTasks(void)
 
 /* ---- task control ------------------------------------------------------- */
 
-static const char *ValidateTask(const char *src, const char *dst)
+static const char *ValidateTask(const char *src, const char *dst, const char *deleted)
 {
     if (!src[0] || !dst[0])          return "Choose both a source and a target folder.";
     if (!DirectoryExists(src))       return "The source folder does not exist.";
     if (SameOrInside(src, dst))      return "Source and target overlap (source is inside the target).";
     if (SameOrInside(dst, src))      return "Source and target overlap (target is inside the source).";
+    if (deleted && deleted[0]) {
+        if (SameOrInside(deleted, src)) return "The deleted-files folder cannot be inside the source folder.";
+        if (SameOrInside(src, deleted)) return "The deleted-files folder cannot contain the source folder.";
+        if (SameOrInside(dst, deleted)) return "The deleted-files folder cannot contain the target folder.";
+    }
     return NULL;
+}
+
+/* `path` with the volume root `oldRoot` ("E:\" or "/media/me/STICK") swapped for `newRoot`. False when `path` is not on that volume. */
+static bool RemapVolume(const char *path, const char *oldRoot, const char *newRoot, char *out, size_t cap)
+{
+    size_t olen = oldRoot[1] == ':' ? 2 : strlen(oldRoot);                          /* "E:" ; "E:\Backup" -> "\Backup" */
+    while (olen > 1 && (oldRoot[olen - 1] == '/' || oldRoot[olen - 1] == '\\') && oldRoot[1] != ':') olen--;
+    if (strlen(path) < olen) return false;
+    for (size_t i = 0; i < olen; i++) {
+        char a = path[i], b = oldRoot[i];
+#ifdef _WIN32
+        a = (char)tolower((unsigned char)a); b = (char)tolower((unsigned char)b);
+#endif
+        if (a != b) return false;
+    }
+    const char *rest = path + olen;
+    if (*rest && *rest != '/' && *rest != '\\') return false;                      /* "E:x" or "/media/me/STICK2" is a different volume */
+    while (*rest == '\\' || *rest == '/') rest++;
+    size_t nl = strlen(newRoot);
+    bool sep = nl && (newRoot[nl - 1] == '\\' || newRoot[nl - 1] == '/');
+    snprintf(out, cap, "%s%s%s", newRoot, (sep || !*rest) ? "" : "/", rest);
+    return true;
+}
+
+/* A fresh 16-hex-digit id for a task's marker file. */
+static void NewUsbId(char *out, size_t cap)
+{
+    static unsigned long long counter = 0;
+    unsigned long long h = (unsigned long long)time(NULL) * 0x9E3779B97F4A7C15ull;
+    h ^= ((unsigned long long)clock() << 24) ^ (unsigned long long)(size_t)out ^ (++counter * 0xBF58476D1CE4E5B9ull);
+    h ^= (unsigned long long)GetRandomValue(0, 0x7fffffff) << 17;
+    h ^= h >> 31; h *= 0x94D049BB133111EBull; h ^= h >> 29;                       /* mix */
+    snprintf(out, cap, "%016llx", h);
+}
+
+/* Writes (or completes) the task's marker in `folder`, a target the sync used or the user picked. The id is created on first use.
+   Only done when the folder exists, so a missing drive never gets a folder made on it. */
+static bool UsbWriteMarker(ShsTaskDef *d, const char *folder)
+{
+    if (!d->usbSync || !d->usbMark || !folder[0] || !DirectoryExists(folder)) return false;
+    char id[sizeof d->usbId];
+    if (d->usbId[0]) snprintf(id, sizeof id, "%s", d->usbId); else NewUsbId(id, sizeof id);
+    if (!ShsMarkerAdd(folder, id)) return false;
+    snprintf(d->usbId, sizeof d->usbId, "%s", id);
+    return true;
+}
+
+/* USB sync: where the task's target and deleted-files folder are right now. Once the task has written its marker file
+   (.simplesync-id) into the target, the stick is recognised by that file: on the old drive letter if it is still there,
+   else on whichever connected drive has the same folder with the task's id in it. A different stick on the old letter has
+   no such file and is left alone. Returns false when the stick is not connected. */
+static bool UsbResolve(const ShsTaskDef *d, char *tgt, size_t tcap, char *del, size_t dcap)
+{
+    snprintf(tgt, tcap, "%s", d->target);
+    snprintf(del, dcap, "%s", d->deletedDir);
+    char root[SHS_DEF_PATH_MAX];
+    if (!ShsVolumeRoot(d->target, root, sizeof root)) return true;                 /* not on a drive that comes and goes */
+    const bool mounted = ShsVolumeMounted(root);
+    if (!d->usbMark || !d->usbId[0]) return mounted;                                              /* no marker yet: the drive path is all we know */
+    if (mounted && ShsMarkerHas(d->target, d->usbId)) return true;                 /* the right stick, where it was */
+
+    char vols[16][SHS_VOLUME_PATH], rootN[SHS_DEF_PATH_MAX], volN[SHS_DEF_PATH_MAX], cand[SHS_DEF_PATH_MAX];
+    NormPath(rootN, sizeof rootN, root);
+    int n = ShsListVolumes(vols, 16);
+    for (int k = 0; k < n; k++) {
+        NormPath(volN, sizeof volN, vols[k]);
+        if (!strcmp(volN, rootN)) continue;                                        /* the old place was checked above */
+        if (!RemapVolume(d->target, root, vols[k], cand, sizeof cand) || !ShsMarkerHas(cand, d->usbId)) continue;
+        snprintf(tgt, tcap, "%s", cand);                                           /* found: the same stick under another letter or mount point */
+        if (d->deletedDir[0]) RemapVolume(d->deletedDir, root, vols[k], del, dcap);   /* only changes it when it is on that stick */
+        return true;
+    }
+    return false;
 }
 
 /* Starts a task. For a Quick Copy, `item` (a dropped file or folder) is copied into the target instead of the source folder. */
@@ -466,7 +574,19 @@ static void StartTaskItem(int i, const char *item)
 {
     AppTask *a = &g_app[i];
     if (a->job) return;
-    const char *bad = item ? NULL : ValidateTask(a->def.source, a->def.target);
+    char tgtBuf[SHS_DEF_PATH_MAX], delBuf[SHS_DEF_PATH_MAX];
+    const char *tgt = a->def.target, *del = a->def.deletedDir;
+    if (!item && !a->quick && a->def.usbSync) {                       /* USB sync: the stick must be there, and be the right one */
+        if (!UsbResolve(&a->def, tgtBuf, sizeof tgtBuf, delBuf, sizeof delBuf)) {
+            a->failed = true;
+            snprintf(a->resultMsg, sizeof a->resultMsg, "The USB drive for this task is not connected.");
+            LogAdd("%s: %s", a->def.name, a->resultMsg);
+            return;
+        }
+        if (strcmp(tgtBuf, a->def.target)) LogAdd("%s: the USB drive is now %s", a->def.name, tgtBuf);
+        tgt = tgtBuf; del = delBuf;
+    }
+    const char *bad = item ? NULL : ValidateTask(a->def.source, tgt, a->def.mirror ? del : NULL);
     if (item && SameOrInside(a->def.target, item)) bad = "The target is inside the dropped folder.";
     if (bad) {
         a->failed = true;
@@ -475,9 +595,10 @@ static void StartTaskItem(int i, const char *item)
         return;
     }
     if (a->doneJob) { ShsSyncFree(a->doneJob); a->doneJob = NULL; }
+    snprintf(a->runTarget, sizeof a->runTarget, "%s", tgt);
     if (item)          a->job = ShsSyncStartItem(item, a->def.target, SHS_CONFLICT_ASK);
     else if (a->quick) a->job = ShsSyncStartItem(a->def.source, a->def.target, SHS_CONFLICT_ASK);   /* the folder itself lands in the target, like dropped folders */
-    else               a->job = ShsSyncStart(a->def.source, a->def.target, a->def.mirror);
+    else               a->job = ShsSyncStartExcl(a->def.source, tgt, a->def.mirror, del, a->def.includeFolder, a->def.exclude);
     if (!a->job) {
         a->failed = true;
         snprintf(a->resultMsg, sizeof a->resultMsg, "Could not start the sync thread.");
@@ -493,7 +614,8 @@ static void StartTaskItem(int i, const char *item)
         ShsSyncSetVerify(a->job, a->quickVerify);
         TaskLog(a, "Copy started: %s -> %s", item ? item : a->def.source, a->def.target);
     } else {
-        LogAdd("%s: sync started%s", a->def.name, a->def.mirror ? " (mirror)" : "");
+        LogAdd("%s: sync started%s%s", a->def.name, a->def.mirror ? " (mirror)" : "",
+               a->def.mirror && a->def.deletedDir[0] ? ", removed files go to the deleted-files folder" : "");
     }
 }
 
@@ -522,14 +644,16 @@ static int QueryRows(void *ctx, int filter, int first, int max, ShsTaskRow *out,
     ShsSyncJob *j = a->job ? a->job : a->doneJob;
     *total = 0;
     if (!j) return 0;
-    static const unsigned MASK[4] = {
-        ~0u,
+    static const unsigned MASK[6] = {
+        ~(1u << SHS_FILE_IGNORED),                  /* "all" leaves out the temp files that were never part of the copy */
         (1u << SHS_FILE_PENDING) | (1u << SHS_FILE_COPYING) | (1u << SHS_FILE_VERIFYING),
         1u << SHS_FILE_DONE,
-        (1u << SHS_FILE_FAILED) | (1u << SHS_FILE_SKIPPED) };
+        (1u << SHS_FILE_FAILED) | (1u << SHS_FILE_SKIPPED),
+        1u << SHS_FILE_REMOVED,
+        1u << SHS_FILE_IGNORED };
     static ShsSyncFileRow tmp[16];
     if (max > 16) max = 16;
-    int n = ShsSyncGetFiles(j, MASK[filter & 3], first, max, tmp, total);
+    int n = ShsSyncGetFiles(j, MASK[filter >= 0 && filter < 6 ? filter : 0], first, max, tmp, total);
     for (int k = 0; k < n; k++) {
         snprintf(out[k].name, sizeof out[k].name, "%s", tmp[k].name);
         out[k].size = tmp[k].size;
@@ -543,7 +667,7 @@ static void FinishTask(int i)
     AppTask *a = &g_app[i];
     ShsSyncStatus s;
     ShsSyncGetStatus(a->job, &s);
-    if (a->quick) a->doneJob = a->job;               /* keep it: the card's file list reads from it */
+    if (a->quick || ShsSyncFileCount(a->job) <= 100000) a->doneJob = a->job;   /* keep it: the card's file lists (copied / removed / errors) read from it; a huge run is not worth the memory */
     else          ShsSyncFree(a->job);
     a->job = NULL;
     a->endTime = GetTime();
@@ -555,6 +679,8 @@ static void FinishTask(int i)
     if (s.state == SHS_SYNC_DONE) {
         a->def.lastSync = (long long)time(NULL);
         a->def.lastBytes = (long long)s.bytesDone;
+        if (a->def.usbSync && !a->quick && !a->def.usbId[0] && !UsbWriteMarker(&a->def, a->runTarget))   /* first good run: mark the stick */
+            LogAdd("%s: could not write the .simplesync-id marker into %s", a->def.name, a->runTarget);
         a->failed = false;
         LogAdd("%s: done - %llu file(s) copied, %llu removed", a->def.name,
                (unsigned long long)s.filesDone, (unsigned long long)s.filesDeleted);
@@ -611,7 +737,7 @@ static void WatchTasks(void)
         if (!a->def.autoSync) { if (a->watch) StopWatch(i); continue; }
         if (!a->watch) {
             if (now < a->nextWatchTry) continue;
-            a->watch = ShsWatchStart(a->def.source);
+            a->watch = ShsWatchStart(a->def.source, a->def.exclude);
             if (!a->watch) { a->nextWatchTry = now + 5.0; continue; }          /* folder missing: try again in a few seconds */
             LogAdd("%s: auto-sync watching %s", a->def.name, a->def.source);
             a->pending = true;
@@ -623,6 +749,70 @@ static void WatchTasks(void)
             LogAdd("%s: change detected, syncing", a->def.name);
             StartTask(i);
         }
+    }
+}
+
+/* USB sync: when the drive that holds a task's target gets connected, sync once after it has had a moment to settle.
+   A drive that is already connected when the app starts does not trigger anything; only a new connection does. */
+#define USB_POLL_S    2.0
+#define USB_SETTLE_S  3.0
+static void UsbTasks(void)
+{
+    double now = GetTime();
+    for (int i = 0; i < g_count; i++) {
+        AppTask *a = &g_app[i];
+        if (a->quick || !a->def.usbSync) { a->usbInit = false; a->usbSyncAt = 0; continue; }
+        if (now >= a->nextUsbPoll) {
+            a->nextUsbPoll = now + USB_POLL_S;
+            char tgt[SHS_DEF_PATH_MAX], del[SHS_DEF_PATH_MAX];
+            bool present = UsbResolve(&a->def, tgt, sizeof tgt, del, sizeof del);       /* the right stick, even under a new drive letter */
+            if (a->usbInit && present && !a->usbSeen) {
+                a->usbSyncAt = now + USB_SETTLE_S;
+                LogAdd("%s: USB drive %s connected", a->def.name, tgt);
+            }
+            if (!present) a->usbSyncAt = 0;                        /* unplugged again before the sync started */
+            a->usbSeen = present;
+            a->usbInit = true;
+        }
+        if (a->usbSyncAt && now >= a->usbSyncAt && !a->job) {
+            a->usbSyncAt = 0;
+            LogAdd("%s: syncing because the drive was connected", a->def.name);
+            StartTask(i);
+        }
+    }
+}
+
+/* Update check: once shortly after start-up and then daily while the option is on; the result shows in the status bar. */
+#define UPDATE_FIRST_S   8.0
+#define UPDATE_EVERY_S   86400.0
+static void UpdateCheckNow(bool manual)
+{
+    if (ShsUpdateCheckStart(g_updateDev)) { if (manual) snprintf(g_updateMsg, sizeof g_updateMsg, "Checking..."); }
+}
+
+static void UpdateTick(void)
+{
+    double now = GetTime();
+    if (g_checkUpdates && now >= g_nextUpdateCheck && now >= UPDATE_FIRST_S) {
+        g_nextUpdateCheck = now + UPDATE_EVERY_S;
+        UpdateCheckNow(false);
+    }
+    char tag[64], url[256];
+    int r = ShsUpdateCheckPoll(tag, sizeof tag, url, sizeof url);
+    if (r == 1) {
+        if (g_updateDev ? ShsVersionNewer(tag, SHS_VERSION) : ShsVersionCoreNewer(tag, SHS_VERSION)) {
+            bool fresh = !g_updateFound || strcmp(g_updateTag, tag);
+            g_updateFound = true;
+            snprintf(g_updateTag, sizeof g_updateTag, "%s", tag);
+            snprintf(g_updateUrl, sizeof g_updateUrl, "%s", url);
+            snprintf(g_updateMsg, sizeof g_updateMsg, "Version %s is available", tag);
+            if (fresh) LogAdd("Update available: %s (you have %s)", tag, SHS_VERSION);
+        } else {
+            g_updateFound = false;
+            snprintf(g_updateMsg, sizeof g_updateMsg, "You are up to date (latest release: %s)", tag);
+        }
+    } else if (r == -1) {
+        snprintf(g_updateMsg, sizeof g_updateMsg, "Could not check for updates (offline, or no release yet)");
     }
 }
 
@@ -650,6 +840,8 @@ static void BuildView(const AppTask *a, ShsTask *v)
     v->mirror = a->def.mirror;
     v->autoSync = a->def.autoSync;
     v->quick = a->quick;
+    v->rows = QueryRows;                                              /* file lists: Quick Copy panel, and the copied / removed / errors tabs of a sync card */
+    v->rowsCtx = (void *)a;
 
     if (a->quick) {                                                   /* Quick Copy expanded panel data */
         v->rows = QueryRows;
@@ -687,7 +879,7 @@ static void BuildView(const AppTask *a, ShsTask *v)
             if (fs->recent[k].state == SHS_FILE_COPYING || fs->recent[k].state == SHS_FILE_VERIFYING) v->activeFiles++;
         if (v->elapsedSec > 1.0f) v->avgMBps = (float)((double)fs->bytesDone / 1048576.0 / v->elapsedSec);
         v->filesDone = fs->filesDone; v->filesTotal = fs->filesTotal;
-        v->filesRemoved = fs->filesDeleted; v->errors = fs->errorCount;
+        v->filesRemoved = fs->filesDeleted; v->errors = fs->errorCount; v->filesIgnored = fs->filesIgnored;
         v->fileCount = fs->recentCount < SHS_TASK_FILES ? fs->recentCount : SHS_TASK_FILES;
         for (int k = 0; k < v->fileCount; k++) {
             snprintf(v->files[k].name, sizeof v->files[k].name, "%s", fs->recent[k].name);
@@ -717,7 +909,7 @@ static void BuildView(const AppTask *a, ShsTask *v)
         return;
     }
 
-    char meta[96];
+    char meta[160];
     snprintf(meta, sizeof meta, "%s", a->quick ? "Quick copy - not copied yet" : "Never synced");
     if (a->def.lastSync) {
         char ago[24], sz[24];
@@ -726,7 +918,16 @@ static void BuildView(const AppTask *a, ShsTask *v)
         snprintf(meta, sizeof meta, "%s: %s | %s", a->quick ? "Quick copy done" : "Last synced", ago, sz);
     }
     if (a->def.mirror) strncat(meta, " | Mirror", sizeof meta - strlen(meta) - 1);
+    if (a->def.mirror && a->def.deletedDir[0]) strncat(meta, " (keeps deleted files)", sizeof meta - strlen(meta) - 1);
     if (a->def.autoSync) strncat(meta, " | Auto-sync", sizeof meta - strlen(meta) - 1);
+    if (a->def.usbSync) strncat(meta, " | USB sync", sizeof meta - strlen(meta) - 1);
+    if (a->def.exclude[0]) {
+        int n = 1;
+        for (const char *c = a->def.exclude; *c; c++) if (*c == '|') n++;
+        char ex[32];
+        snprintf(ex, sizeof ex, " | %d excluded", n);
+        strncat(meta, ex, sizeof meta - strlen(meta) - 1);
+    }
     snprintf(v->meta, sizeof v->meta, "%s", meta);
 
     if (a->failed) {
@@ -759,12 +960,23 @@ static void CreateSandbox(void)
 
 static const char *LastFolder(const char *path);
 
+/* Suggested folder for removed files: <target><source folder name>-deleted, so it sits on the target drive next to the copied folder. */
+static void SuggestDeletedDir(const char *src, const char *dst, char *out, size_t cap)
+{
+    char name[SHS_DEF_NAME_MAX * 2];
+    snprintf(name, sizeof name, "%s", src[0] ? LastFolder(src) : "removed");
+    size_t n = strlen(dst);
+    bool ends = n && (dst[n - 1] == '\\' || dst[n - 1] == '/');                 /* a drive root "E:\" already has its separator */
+    snprintf(out, cap, "%s%s%s-deleted", dst, ends ? "" : (strchr(dst, '\\') ? "\\" : "/"), name);
+}
+
 static void DialogOpen(Dialog *d, int editIdx)
 {
     memset(d, 0, sizeof *d);
     d->open = true;
     d->editIdx = editIdx;
     d->drag = g_dragDialog;
+    d->usbMark = true;                     /* a new USB task marks its stick unless told not to (an edited one overrides this below) */
     if (editIdx >= 0) {
         const ShsTaskDef *t = &g_app[editIdx].def;
         snprintf(d->name, sizeof d->name, "%s", t->name);
@@ -772,7 +984,73 @@ static void DialogOpen(Dialog *d, int editIdx)
         snprintf(d->dst, sizeof d->dst, "%s", t->target);
         d->mirror = t->mirror;
         d->autoSync = t->autoSync;
+        d->usbSync = t->usbSync;
+        d->usbMark = t->usbMark;
+        d->includeFolder = t->includeFolder;
+        d->keepDeleted = t->deletedDir[0] != 0;
+        snprintf(d->del, sizeof d->del, "%s", t->deletedDir);
+        snprintf(d->exclude, sizeof d->exclude, "%s", t->exclude);
     }
+}
+
+/* ---- excluded folders (the list is one '|' separated string) ---- */
+
+#define EXCL_UI_MAX 8
+
+static int ExclCount(const char *list)
+{
+    if (!list[0]) return 0;
+    int n = 1;
+    for (const char *c = list; *c; c++) if (*c == '|') n++;
+    return n;
+}
+
+static void ExclGet(const char *list, int idx, char *out, size_t cap)
+{
+    out[0] = 0;
+    for (const char *p = list; *p; ) {
+        const char *e = strchr(p, '|');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (idx-- == 0) { if (n >= cap) n = cap - 1; memcpy(out, p, n); out[n] = 0; return; }
+        if (!e) return;
+        p = e + 1;
+    }
+}
+
+static void ExclRemove(char *list, int idx)
+{
+    char out[1024] = "";
+    for (int i = 0, k = 0, n = ExclCount(list); i < n; i++) {
+        if (i == idx) continue;
+        char item[SHS_DEF_PATH_MAX];
+        ExclGet(list, i, item, sizeof item);
+        snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", k++ ? "|" : "", item);
+    }
+    snprintf(list, 1024, "%s", out);
+}
+
+/* Adds a folder name or a path relative to the source; sets d->exclErr and returns false when it is refused. */
+static bool ExclAdd(Dialog *d, const char *text)
+{
+    char item[SHS_DEF_PATH_MAX];
+    snprintf(item, sizeof item, "%s", text);
+    for (char *c = item; *c; c++) if (*c == '\\') *c = '/';
+    char *s = item;
+    while (*s == ' ' || *s == '/') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '/')) s[--n] = 0;
+    d->exclErr[0] = 0;
+    if (!n) return false;
+    if (strchr(s, '|') || strchr(s, ':') || !strncmp(s, "../", 3) || strstr(s, "/../")) { snprintf(d->exclErr, sizeof d->exclErr, "Use a folder name or a path inside the source folder."); return false; }
+    int cnt = ExclCount(d->exclude);
+    if (cnt >= EXCL_UI_MAX || strlen(d->exclude) + n + 2 >= sizeof d->exclude) { snprintf(d->exclErr, sizeof d->exclErr, "Up to %d excluded folders.", EXCL_UI_MAX); return false; }
+    for (int i = 0; i < cnt; i++) {
+        char other[SHS_DEF_PATH_MAX];
+        ExclGet(d->exclude, i, other, sizeof other);
+        if (!strcmp(other, s)) { snprintf(d->exclErr, sizeof d->exclErr, "Already in the list."); return false; }
+    }
+    snprintf(d->exclude + strlen(d->exclude), sizeof d->exclude - strlen(d->exclude), "%s%s", cnt ? "|" : "", s);
+    return true;
 }
 
 static void DialogOpenQuick(Dialog *d)
@@ -799,7 +1077,7 @@ static void StartQuickCopy(const char *src, const char *dst)
 
 static void DialogSubmit(Dialog *d)
 {
-    const char *bad = ValidateTask(d->src, d->dst);
+    const char *bad = ValidateTask(d->src, d->dst, d->mirror && d->keepDeleted ? d->del : NULL);
     if (bad) { snprintf(d->err, sizeof d->err, "%s", bad); return; }
 
     if (d->quick) {                                  /* Quick Copy: a temporary card, copy only (no deletions), nothing saved */
@@ -822,9 +1100,23 @@ static void DialogSubmit(Dialog *d)
     snprintf(fallback, sizeof fallback, "Task %d", g_count);
     snprintf(a->def.name, sizeof a->def.name, "%s", d->name[0] ? d->name : fallback);
     snprintf(a->def.source, sizeof a->def.source, "%s", d->src);
+    const bool sameTarget = d->editIdx >= 0 && !strcmp(a->def.target, d->dst);          /* editing without changing the target */
+    if (d->editIdx >= 0 && a->def.usbId[0] && (!d->usbSync || !d->usbMark)) {          /* the ID file is no longer wanted: take this task out of it */
+        char otgt[SHS_DEF_PATH_MAX], odel[SHS_DEF_PATH_MAX];
+        if (UsbResolve(&a->def, otgt, sizeof otgt, odel, sizeof odel)) ShsMarkerRemove(otgt, a->def.usbId);
+    }
     snprintf(a->def.target, sizeof a->def.target, "%s", d->dst);
     a->def.mirror = d->mirror;
     a->def.autoSync = d->autoSync;
+    a->def.usbSync = d->usbSync;
+    a->def.usbMark = d->usbMark;
+    if (!d->usbSync || !d->usbMark) a->def.usbId[0] = 0;
+    else if (!(sameTarget && a->def.usbId[0]) && !UsbWriteMarker(&a->def, d->dst))     /* a new target: the user picked this stick, so mark it */
+        a->def.usbId[0] = 0;                                                           /* ...folder not there yet: the first good sync marks it */
+    a->def.includeFolder = d->includeFolder;
+    snprintf(a->def.exclude, sizeof a->def.exclude, "%s", d->exclude);
+    snprintf(a->def.deletedDir, sizeof a->def.deletedDir, "%s", d->mirror && d->keepDeleted ? d->del : "");
+    a->usbInit = false;                          /* start watching the drive again from its current state */
     StopWatch((int)(a - g_app));                 /* restart the watcher on the (possibly new) source folder */
     a->failed = false;
     LogAdd("%s: %s", a->def.name, d->editIdx >= 0 ? "updated" : "added");
@@ -836,8 +1128,8 @@ static void DialogSubmit(Dialog *d)
 static void DialogCheck(float x, float y, float w, const char *label, bool *value)
 {
     Rectangle cb = { x, y + 4, 22, 22 };
-    DrawRectangleRounded(cb, 0.25f, 6, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BG);
-    DrawRectangleRoundedLinesEx(cb, 0.25f, 6, 1.0f, SHS_COLOR_BORDER);
+    ShsRoundRec(cb, 0.25f, 6, *value ? SHS_COLOR_PRIMARY : SHS_COLOR_BG);
+    ShsRoundLines(cb, 0.25f, 6, 1.0f, SHS_COLOR_BORDER);
     if (*value) {
         DrawLineEx((Vector2){ cb.x + 5, cb.y + 11 }, (Vector2){ cb.x + 10, cb.y + 16 }, 2, SHS_COLOR_ON_PRIMARY);
         DrawLineEx((Vector2){ cb.x + 10, cb.y + 16 }, (Vector2){ cb.x + 17, cb.y + 6 }, 2, SHS_COLOR_ON_PRIMARY);
@@ -918,7 +1210,7 @@ static int DropZone(Rectangle r, const char *label, const char *path, const char
     bool filled = path[0] != 0;
     Color edge = hot ? SHS_COLOR_PRIMARY : (filled ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_BORDER);
     FillRound(r, 12.0f, hot ? Fade(SHS_COLOR_PRIMARY, 0.10f) : SHS_COLOR_BG);
-    DashedRoundRect((Rectangle){ r.x + 0.7f, r.y + 0.7f, r.width - 1.4f, r.height - 1.4f }, 11.3f, edge);
+    DashedRoundRect((Rectangle){ r.x + 0.7f, r.y + 0.7f, r.width - 1.4f, r.height - 1.4f }, ShsThemeFlat() ? 0.0f : 11.3f, edge);   /* square corners in the square themes */
     ShsDrawText(label, (int)r.x + 14, (int)r.y + 10, 12, SHS_COLOR_TEXT_MUTED);
 
     Rectangle clr = { r.x + r.width - 32, r.y + 6, 24, 24 };
@@ -935,7 +1227,7 @@ static int DropZone(Rectangle r, const char *label, const char *path, const char
         ShsDrawIcon(SHS_ICON_FOLDER, r.x + 30, r.y + 58, 26.0f, SHS_COLOR_PRIMARY);
         DrawTailFit(LastFolder(path), (int)r.x + 54, (int)r.y + 44, 18, (int)r.width - 54 - 40, SHS_COLOR_TEXT_MAIN);
         DrawTailFit(path, (int)r.x + 16, (int)r.y + 88, 13, (int)r.width - 32, SHS_COLOR_TEXT_MUTED);
-        DrawRectangleRounded(clr, 0.4f, 8, clrHot ? SHS_COLOR_CARD_HOVER : Fade(SHS_COLOR_CARD, 0.8f));
+        ShsRoundRec(clr, 0.4f, 8, clrHot ? SHS_COLOR_CARD_HOVER : Fade(SHS_COLOR_CARD, 0.8f));
         ShsDrawIcon(SHS_ICON_CLOSE, clr.x + clr.width / 2, clr.y + clr.height / 2, 12.0f, clrHot ? SHS_COLOR_TEXT_MAIN : SHS_COLOR_TEXT_MUTED);
     }
     if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return clrHot ? 2 : 1;
@@ -1022,8 +1314,8 @@ static void ConflictDraw(int ti, int W, int H)
 
     const float pw = 700, ph = 492;
     Rectangle p = { (float)((W - pw) / 2), (float)((H - ph) / 2), pw, ph };
-    DrawRectangleRounded(p, 0.03f, 10, SHS_COLOR_CARD);
-    DrawRectangleRoundedLinesEx(p, 0.03f, 10, 1.0f, SHS_COLOR_BORDER);
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.03f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.03f, 10, 1.0f, SHS_COLOR_BORDER); }
     ShsDrawText("Destination file already exists", (int)p.x + 24, (int)p.y + 18, 20, SHS_COLOR_TEXT_MAIN);
 
     Rectangle closeR = { p.x + pw - 44, p.y + 12, 32, 32 };               /* the X stops the copy */
@@ -1095,15 +1387,336 @@ static void ConflictDraw(int ti, int W, int H)
     }
 }
 
-static void DialogDraw(Dialog *d, int W, int H)
+/* ---- delete task dialog ------------------------------------------------------------------------------------------- */
+
+typedef struct { bool open; int idx; bool purge; char err[200]; } DeleteDialog;
+static DeleteDialog g_del;                 /* asks before a task is removed, and whether its synced files go too (never ticked by default) */
+static ShsPurgeJob *g_purge = NULL;        /* background deletion of a removed task's target files (one at a time) */
+static char         g_purgeName[SHS_DEF_NAME_MAX];
+
+/* Where the confirmed deletion would work: the task's target folder, found again on its USB stick if needed. */
+static bool DeleteTargetOf(const AppTask *a, char *tgt, size_t cap)
+{
+    char del[SHS_DEF_PATH_MAX];
+    if (a->def.usbSync) return UsbResolve(&a->def, tgt, cap, del, sizeof del);
+    snprintf(tgt, cap, "%s", a->def.target);
+    return true;
+}
+
+/* Called when "Delete" is pressed. Returns true when the task may be removed now; otherwise g_del.err says why not. */
+static bool DeleteConfirm(void)
+{
+    AppTask *a = &g_app[g_del.idx];
+    g_del.err[0] = 0;
+    char tgt[SHS_DEF_PATH_MAX];
+    const bool have = DeleteTargetOf(a, tgt, sizeof tgt);
+    if (g_del.purge) {
+        if (g_purge) { snprintf(g_del.err, sizeof g_del.err, "Another deletion is still running. Wait for it to finish."); return false; }
+        if (!have) {
+            snprintf(g_del.err, sizeof g_del.err, "The USB drive is not connected, so its files cannot be deleted. Plug it in, or untick the option.");
+            return false;
+        }
+        if (DirectoryExists(tgt)) {
+            g_purge = ShsPurgeStart(a->def.source, tgt, a->def.includeFolder);
+            if (!g_purge) { snprintf(g_del.err, sizeof g_del.err, "Could not start deleting the files."); return false; }
+            snprintf(g_purgeName, sizeof g_purgeName, "%s", a->def.name);
+            LogAdd("%s: deleting its synced files from %s", a->def.name, tgt);
+        } else {
+            LogAdd("%s: the target folder %s does not exist, no files to delete", a->def.name, tgt);
+        }
+    }
+    if (a->def.usbSync && a->def.usbId[0] && have && ShsMarkerRemove(tgt, a->def.usbId)) LogAdd("%s: marker removed from %s", a->def.name, tgt);
+    return true;
+}
+
+/* Result of the background deletion, once it has finished. */
+static void PurgeTick(void)
+{
+    unsigned long long deleted = 0, failed = 0;
+    if (!g_purge || !ShsPurgeStatus(g_purge, &deleted, &failed)) return;
+    LogAdd("%s: deleted %llu file(s) from the target%s", g_purgeName, deleted, failed ? ", some could not be deleted" : "");
+    if (failed) LogAdd("%s: %llu file(s) could not be deleted (in use, or no permission)", g_purgeName, failed);
+    ShsPurgeFree(g_purge);
+    g_purge = NULL;
+}
+
+/* Returns 0 while open, 1 cancelled, 2 "Delete" pressed (the caller runs DeleteConfirm and removes the task). */
+static int DeleteDraw(int W, int H)
 {
     g_block = false;
     FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
+    const AppTask *a = &g_app[g_del.idx];
 
-    const float pw = 640, ph = d->quick ? 372 : 428;
+    const float pw = 620, ph = g_del.purge ? 372.0f : 250.0f;
+    Rectangle p = { (float)((W - pw) / 2), (float)((H - ph) / 2), pw, ph };
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
+    const float x = p.x + 24, w = pw - 48;
+    char fit[SHS_DEF_PATH_MAX + 64], line[SHS_DEF_PATH_MAX + 128];
+
+    ShsDrawText("Delete task", (int)x, (int)p.y + 20, 22, SHS_COLOR_TEXT_MAIN);
+    snprintf(line, sizeof line, "Delete the task \"%s\"?", a->def.name);
+    ShsDrawText(FitTail(fit, sizeof fit, line, 16, w), (int)x, (int)p.y + 62, 16, SHS_COLOR_TEXT_MAIN);
+    ShsDrawText("The task is removed from SimpleSync. Your source folder is not touched.", (int)x, (int)p.y + 90, 14, SHS_COLOR_TEXT_MUTED);
+
+    DialogCheck(x, p.y + 122, w, "Also delete the files this task synced to the target", &g_del.purge);
+    float y = p.y + 166;
+    if (g_del.purge) {
+        char tgt[SHS_DEF_PATH_MAX];
+        const bool have = DeleteTargetOf(a, tgt, sizeof tgt);
+        if (a->def.includeFolder) {
+            char name[SHS_DEF_NAME_MAX * 2];
+            snprintf(name, sizeof name, "%s", LastFolder(a->def.source));
+            snprintf(line, sizeof line, "Permanently deletes the folder \"%s%s%s\" and everything in it.", tgt, strchr(tgt, '\\') ? "\\" : "/", name);
+        } else {
+            snprintf(line, sizeof line, "Permanently deletes the files in \"%s\" that also exist in the source folder. Other files stay.", tgt);
+        }
+        ShsDrawIcon(SHS_ICON_WARN, x + 10, y + 12, 18.0f, SHS_COLOR_DANGER);
+        ShsDrawText(FitTail(fit, sizeof fit, line, 14, w - 34), (int)x + 30, (int)y + 4, 14, SHS_COLOR_DANGER);
+        ShsDrawText("This cannot be undone, and the files do not go to the Recycle Bin.", (int)x + 30, (int)y + 28, 14, SHS_COLOR_DANGER);
+        ShsDrawText(have ? "Files that are open in another program may not be deleted." : "The USB drive is not connected right now.", (int)x + 30, (int)y + 52, 14, SHS_COLOR_TEXT_MUTED);
+        y += 84;
+    }
+    if (g_del.err[0]) ShsDrawText(FitTail(fit, sizeof fit, g_del.err, 14, w), (int)x, (int)y + 2, 14, SHS_COLOR_DANGER);
+
+    Rectangle ok = { p.x + pw - 24 - (g_del.purge ? 210.0f : 150.0f), p.y + ph - 56, g_del.purge ? 210.0f : 150.0f, 36 };
+    Rectangle cancel = { ok.x - 118, ok.y, 110, 36 };
+    int result = 0;
+    if (ButtonI(cancel, "Cancel", SHS_ICON_CLOSE, false, false)) result = 1;
+    if (g_del.purge) {                                                    /* the destructive choice looks like one */
+        bool hot = CheckCollisionPointRec(Mouse(), ok);
+        ShsDrawButtonBox(ok, 8.0f, hot ? Fade(SHS_COLOR_DANGER, 0.85f) : SHS_COLOR_DANGER, SHS_COLOR_DANGER, hot && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        const char *lb = "Delete task and files";
+        ShsDrawText(lb, (int)(ok.x + (ok.width - ShsMeasureText(lb, 15)) / 2), (int)ok.y + 9, 15, SHS_COLOR_ON_PRIMARY);
+        if (hot && Pressed()) result = 2;
+    } else if (ButtonI(ok, "Delete task", SHS_ICON_TRASH, true, false)) {
+        result = 2;
+    }
+    if (IsKeyPressed(KEY_ESCAPE)) result = 1;
+    if (!g_del.purge && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))) result = 2;   /* Enter never confirms a file deletion */
+    return result;
+}
+
+/* Switch knob: round, or square in the square themes (raised in the bevel themes). */
+static void DrawSwitch(Rectangle sw, bool on)
+{
+    if (ShsThemeClassic() && !ShsThemeFlat() && !ShsThemeBevel()) {      /* Mac Platinum, GNOME 2: a rounded square, not a pill */
+        ShsDrawRoundedBox(sw, 4.0f, on ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER, (Color){ 0, 0, 0, 0 });
+        ShsDrawRoundedBox((Rectangle){ sw.x + (on ? 24.0f : 3.0f), sw.y + 3, 17, 18 }, 3.0f, SHS_COLOR_ON_PRIMARY, (Color){ 0, 0, 0, 0 });
+        return;
+    }
+    ShsRoundRec(sw, 1.0f, 16, on ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
+    if (ShsThemeFlat() || ShsThemeBevel()) {
+        Rectangle k = { sw.x + (on ? 24.0f : 3.0f), sw.y + 3, 17, 18 };
+        if (ShsThemeBevel()) ShsDrawBevel(k, false, SHS_COLOR_BG);
+        else                 DrawRectangleRec(k, SHS_COLOR_ON_PRIMARY);
+    } else DrawCircleV((Vector2){ sw.x + (on ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
+}
+
+/* ---- excluded-folders tree: the source folder's subfolders, each with a tick (ticked = copied) ---- */
+
+#define TREE_MAX 600
+
+typedef struct { char rel[SHS_DEF_PATH_MAX]; int depth; bool open, leaf; } TreeNode;
+
+static TreeNode g_tree[TREE_MAX];
+static int      g_treeN = 0, g_treeScroll = 0;
+static bool     g_treeReady = false;                /* cleared when the panel opens: the tree is read again */
+
+static bool ExclEq(const char *a, size_t n, const char *b)
+{
+    for (size_t i = 0; i < n; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return b[n] == 0;
+}
+
+/* How an entry of the list applies to the folder `rel`: 2 = it excludes this very folder, 1 = it excludes a parent, 0 = no. */
+static int ExclEntryHit(const char *e, const char *rel)
+{
+    size_t el = strlen(e), rl = strlen(rel);
+    if (!strchr(e, '/')) {
+        int hit = 0;
+        for (const char *c = rel; *c; ) {
+            const char *s = strchr(c, '/');
+            size_t cl = s ? (size_t)(s - c) : strlen(c);
+            if (cl == el && ExclEq(c, cl, e)) hit = s ? 1 : 2;
+            if (!s) break;
+            c = s + 1;
+        }
+        return hit;
+    }
+    if (rl == el && ExclEq(rel, el, e)) return 2;
+    if (rl > el && rel[el] == '/' && ExclEq(rel, el, e)) return 1;
+    return 0;
+}
+
+static int ExclStatus(const char *list, const char *rel)
+{
+    int best = 0;
+    for (int i = 0, n = ExclCount(list); i < n; i++) {
+        char e[SHS_DEF_PATH_MAX];
+        ExclGet(list, i, e, sizeof e);
+        int h = ExclEntryHit(e, rel);
+        if (h > best) best = h;
+    }
+    return best;
+}
+
+static int TreeNameCmp(const void *a, const void *b)
+{
+    const char *x = GetFileName(*(const char *const *)a), *y = GetFileName(*(const char *const *)b);
+    for (; *x && *y; x++, y++) {
+        int cx = tolower((unsigned char)*x), cy = tolower((unsigned char)*y);
+        if (cx != cy) return cx - cy;
+    }
+    return tolower((unsigned char)*x) - tolower((unsigned char)*y);
+}
+
+/* Lists the subfolders of node `idx` (-1 = the source folder itself) right below it. */
+static void TreeLoad(const char *src, int idx)
+{
+    char dir[SHS_DEF_PATH_MAX * 2];
+    if (idx < 0) snprintf(dir, sizeof dir, "%s", src);
+    else         snprintf(dir, sizeof dir, "%s/%s", src, g_tree[idx].rel);
+    FilePathList fl = LoadDirectoryFiles(dir);
+    const char *dirs[512];
+    int nd = 0;
+    for (unsigned i = 0; i < fl.count && nd < 512; i++) if (DirectoryExists(fl.paths[i])) dirs[nd++] = fl.paths[i];
+    qsort(dirs, (size_t)nd, sizeof dirs[0], TreeNameCmp);
+    int room = TREE_MAX - g_treeN, ins = nd < room ? nd : room, at = idx + 1;
+    memmove(&g_tree[at + ins], &g_tree[at], (size_t)(g_treeN - at) * sizeof g_tree[0]);
+    for (int i = 0; i < ins; i++) {
+        TreeNode *n = &g_tree[at + i];
+        memset(n, 0, sizeof *n);
+        const char *nm = GetFileName(dirs[i]);
+        if (idx < 0) snprintf(n->rel, sizeof n->rel, "%s", nm);
+        else         snprintf(n->rel, sizeof n->rel, "%s/%s", g_tree[idx].rel, nm);
+        n->depth = idx < 0 ? 0 : g_tree[idx].depth + 1;
+    }
+    g_treeN += ins;
+    if (idx >= 0) { g_tree[idx].open = true; g_tree[idx].leaf = nd == 0; }
+    UnloadDirectoryFiles(fl);
+}
+
+static void TreeCollapse(int idx)
+{
+    int end = idx + 1;
+    while (end < g_treeN && g_tree[end].depth > g_tree[idx].depth) end++;
+    memmove(&g_tree[idx + 1], &g_tree[end], (size_t)(g_treeN - end) * sizeof g_tree[0]);
+    g_treeN -= end - idx - 1;
+    g_tree[idx].open = false;
+}
+
+/* The excluded-folders panel (replaces the task dialog while open). */
+static void DialogExclDraw(Dialog *d, int W, int H)
+{
+    g_block = false;
+    FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
+    const float pw = 640, ph = fminf(560.0f, (float)H - 40);
     Rectangle p = { (W - pw) / 2, (H - ph) / 2, pw, ph };
-    DrawRectangleRounded(p, 0.04f, 10, SHS_COLOR_CARD);
-    DrawRectangleRoundedLinesEx(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER);
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
+    const float x = p.x + 24, w = pw - 48;
+    ShsDrawText("Excluded folders", (int)x, (int)p.y + 20, 22, SHS_COLOR_TEXT_MAIN);
+    ShsDrawText("Untick a folder to leave it out of the sync. Tick it again to bring it back.", (int)x, (int)p.y + 54, 13, SHS_COLOR_TEXT_MUTED);
+    ShsDrawText("Typing a name (node_modules) leaves out every folder of that name, at any depth.", (int)x, (int)p.y + 72, 13, SHS_COLOR_TEXT_MUTED);
+
+    Rectangle fIn = { x, p.y + 96, w - 100, 32 }, bAdd = { x + w - 90, p.y + 96, 90, 32 };
+    HandleTyping(d->exclIn, sizeof d->exclIn);
+    DrawField(fIn, d->exclIn, "Folder name to leave out everywhere", true, SHS_ICON_NONE);
+    bool add = ButtonI(bAdd, "Add", SHS_ICON_PLUS, false, false);
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        if (d->exclIn[0]) add = true;
+        else { d->exclOpen = false; return; }
+    }
+    if (add && ExclAdd(d, d->exclIn)) d->exclIn[0] = 0;
+    if (d->exclErr[0]) ShsDrawText(d->exclErr, (int)x, (int)p.y + 132, 14, SHS_COLOR_DANGER);
+
+    /* the tree */
+    const float rowH = 26;
+    Rectangle box = { x, p.y + 154, w, ph - 154 - 70 };
+    ShsDrawRoundedBox(box, 6.0f, SHS_COLOR_CARD, SHS_COLOR_BORDER);
+    const int vis = (int)((box.height - 8) / rowH);
+    if (!d->src[0] || !DirectoryExists(d->src)) {
+        ShsDrawText("Choose an existing source folder first.", (int)box.x + 12, (int)box.y + 12, 15, SHS_COLOR_TEXT_MUTED);
+    } else {
+        if (!g_treeReady) { g_treeReady = true; g_treeN = 0; g_treeScroll = 0; TreeLoad(d->src, -1); }
+        if (g_treeN == 0) ShsDrawText("This folder has no subfolders.", (int)box.x + 12, (int)box.y + 12, 15, SHS_COLOR_TEXT_MUTED);
+        if (CheckCollisionPointRec(GetMousePosition(), box)) g_treeScroll -= (int)GetMouseWheelMove() * 3;
+        if (g_treeScroll > g_treeN - vis) g_treeScroll = g_treeN - vis;
+        if (g_treeScroll < 0) g_treeScroll = 0;
+        const bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        const Vector2 m = GetMousePosition();
+        int toggle = -1, expand = -1;
+        for (int r = 0; r < vis && g_treeScroll + r < g_treeN; r++) {
+            const int i = g_treeScroll + r;
+            const TreeNode *n = &g_tree[i];
+            const float ry = box.y + 4 + r * rowH, ix = box.x + 8 + n->depth * 22.0f;
+            const int st = ExclStatus(d->exclude, n->rel);
+            Rectangle arrow = { ix, ry, 20, rowH }, cb = { ix + 22, ry + 4, 18, 18 };
+            if (!n->leaf) {
+                ShsDrawText(n->open ? "-" : "+", (int)ix + 6, (int)ry + 5, 15, SHS_COLOR_TEXT_MUTED);
+                if (click && CheckCollisionPointRec(m, arrow)) expand = i;
+            }
+            ShsRoundRec(cb, 0.25f, 6, st ? SHS_COLOR_BG : SHS_COLOR_PRIMARY);
+            ShsRoundLines(cb, 0.25f, 6, 1.0f, st == 1 ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_BORDER);
+            if (!st) {
+                DrawLineEx((Vector2){ cb.x + 4, cb.y + 9 }, (Vector2){ cb.x + 8, cb.y + 13 }, 2, SHS_COLOR_ON_PRIMARY);
+                DrawLineEx((Vector2){ cb.x + 8, cb.y + 13 }, (Vector2){ cb.x + 14, cb.y + 5 }, 2, SHS_COLOR_ON_PRIMARY);
+            }
+            ShsDrawIcon(SHS_ICON_FOLDER, cb.x + 34, ry + rowH / 2, 15.0f, st ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_PRIMARY);
+            char fit[SHS_DEF_PATH_MAX];
+            const char *nm = strrchr(n->rel, '/');
+            nm = nm ? nm + 1 : n->rel;
+            const float tx = cb.x + 50;
+            ShsDrawText(FitTail(fit, sizeof fit, nm, 14, box.x + box.width - tx - 8), (int)tx, (int)ry + 6, 14, st ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_TEXT_MAIN);
+            Rectangle hit = { cb.x - 2, ry, box.x + box.width - cb.x - 2, rowH };
+            if (click && st != 1 && CheckCollisionPointRec(m, hit)) toggle = i;
+        }
+        if (g_treeN > vis) {                                          /* scroll bar */
+            float th = fmaxf(24.0f, (box.height - 8) * vis / g_treeN);
+            float ty = box.y + 4 + (box.height - 8 - th) * g_treeScroll / (float)(g_treeN - vis);
+            DrawRectangle((int)(box.x + box.width - 6), (int)ty, 4, (int)th, SHS_COLOR_BORDER);
+        }
+        if (expand >= 0) { if (g_tree[expand].open) TreeCollapse(expand); else TreeLoad(d->src, expand); }
+        else if (toggle >= 0) {
+            d->exclErr[0] = 0;
+            if (ExclStatus(d->exclude, g_tree[toggle].rel) == 2) {   /* tick it again: drop every entry that names this folder */
+                for (int i = ExclCount(d->exclude) - 1; i >= 0; i--) {
+                    char e[SHS_DEF_PATH_MAX];
+                    ExclGet(d->exclude, i, e, sizeof e);
+                    if (ExclEntryHit(e, g_tree[toggle].rel) == 2) ExclRemove(d->exclude, i);
+                }
+            } else ExclAdd(d, g_tree[toggle].rel);
+        }
+    }
+
+    const int ne = ExclCount(d->exclude);
+    char sum[64];
+    snprintf(sum, sizeof sum, ne ? "%d excluded" : "Nothing excluded", ne);
+    ShsDrawText(sum, (int)x, (int)(p.y + ph - 46), 15, SHS_COLOR_TEXT_MUTED);
+    if (ne && ButtonI((Rectangle){ x + 130, p.y + ph - 56, 100, 36 }, "Clear", SHS_ICON_CLOSE, false, false)) d->exclude[0] = 0;
+    Rectangle done = { p.x + pw - 24 - 110, p.y + ph - 56, 110, 36 };
+    if (ButtonI(done, "Done", SHS_ICON_CHECK, true, false) || IsKeyPressed(KEY_ESCAPE)) d->exclOpen = false;
+}
+
+static void DialogDraw(Dialog *d, int W, int H)
+{
+    if (d->exclOpen) { DialogExclDraw(d, W, H); return; }
+    g_block = false;
+    FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, Fade(BLACK, 0.6f));
+
+    const bool showDel = !d->quick && d->mirror && d->keepDeleted;     /* the deleted-files folder row */
+    const bool showMark = !d->quick && d->usbSync;                     /* the ID file option, with its explanation */
+    /* option rows, as y offsets under the fields; each one is 32 px, the ID file option has a 36 px explanation under it */
+    const float oUsb = 196 + 3 * 32.0f, oMark = oUsb + 32;
+    const float oKeep = oMark + (showMark ? 32 + 36 : 0);
+    const float oDel = oKeep + 32;
+    const float rowsEnd = (d->mirror ? oKeep + 32 + (showDel ? 44 : 0) : oKeep);   /* y offset below the last option row */
+    const float endY = rowsEnd + (d->quick ? 0 : 40);                              /* the excluded-folders row sits under the options */
+    const float pw = 640, ph = d->quick ? 372 : endY + 124;
+    Rectangle p = { (W - pw) / 2, (H - ph) / 2, pw, ph };
+    if (ShsThemeBevel()) ShsDrawBevel(p, false, SHS_COLOR_BG);
+    else { ShsRoundRec(p, 0.04f, 10, SHS_COLOR_CARD); ShsRoundLines(p, 0.04f, 10, 1.0f, SHS_COLOR_BORDER); }
     ShsDrawText(d->quick ? "Quick Copy" : (d->editIdx >= 0 ? "Edit Sync Task" : "New Sync Task"), (int)p.x + 24, (int)p.y + 20, 22, SHS_COLOR_TEXT_MAIN);
 
     /* mode switch, top right: Drag & drop folders [switch] */
@@ -1111,8 +1724,7 @@ static void DialogDraw(Dialog *d, int W, int H)
         const char *swLabel = "Drag & drop folders";
         int lw = ShsMeasureText(swLabel, 14);
         Rectangle sw = { p.x + pw - 24 - 44, p.y + 22, 44, 24 };
-        DrawRectangleRounded(sw, 1.0f, 16, d->drag ? SHS_COLOR_PRIMARY : SHS_COLOR_BORDER);
-        DrawCircleV((Vector2){ sw.x + (d->drag ? 33.0f : 11.0f), sw.y + 12 }, 8.5f, SHS_COLOR_ON_PRIMARY);
+        DrawSwitch(sw, d->drag);
         ShsDrawText(swLabel, (int)(sw.x - 12 - lw), (int)p.y + 26, 14, SHS_COLOR_TEXT_MUTED);
         Rectangle hit = { sw.x - 16 - lw, sw.y - 4, 16 + lw + 44, 32 };
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), hit)) {
@@ -1140,16 +1752,23 @@ static void DialogDraw(Dialog *d, int W, int H)
     } else {
         ShsDrawText("NAME (optional)", (int)x, (int)y + 2, 12, SHS_COLOR_TEXT_MUTED);
     }
-    char *bufs[3] = { d->name, d->src, d->dst };
-    const size_t caps[3] = { sizeof d->name, sizeof d->src, sizeof d->dst };
-    Rectangle fields[3] = { fName, fSrc, fDst };
-    const char *hint[3] = { "e.g. Photos backup", "Folder to copy from", "Folder to copy to" };
+    Rectangle fDel = { x, y + oDel, w - 100, 34 };
+    Rectangle bDel = { x + w - 90, y + oDel, 90, 34 };
+    char *bufs[4] = { d->name, d->src, d->dst, d->del };
+    const size_t caps[4] = { sizeof d->name, sizeof d->src, sizeof d->dst, sizeof d->del };
+    Rectangle fields[4] = { fName, fSrc, fDst, fDel };
+    const char *hint[4] = { "e.g. Photos backup", "Folder to copy from", "Folder to copy to", "Folder for files removed from the source" };
+    const int nFields = showDel ? 4 : 3;
 
     if (d->drag) {
-        d->focus = 0;
+        if (d->focus != 3 || !showDel) d->focus = 0;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !d->quick) {
+            if (CheckCollisionPointRec(GetMousePosition(), fName)) d->focus = 0;
+            else if (showDel && CheckCollisionPointRec(GetMousePosition(), fDel)) d->focus = 3;
+        }
         if (!d->quick) {
-            HandleTyping(d->name, sizeof d->name);
-            DrawField(fName, d->name, hint[0], true, SHS_ICON_NONE);
+            if (d->focus == 0) HandleTyping(d->name, sizeof d->name);
+            DrawField(fName, d->name, hint[0], d->focus == 0, SHS_ICON_NONE);
         }
 
         int a = DropZone(zSrc, "SOURCE FOLDER", d->src, "source");
@@ -1164,12 +1783,13 @@ static void DialogDraw(Dialog *d, int W, int H)
         ShsDrawText("TARGET FOLDER", (int)x, (int)y + 126, 12, SHS_COLOR_TEXT_MUTED);
 
         const int first = d->quick ? 1 : 0;                  /* Quick Copy has no name field */
+        if (d->focus >= nFields) d->focus = 0;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-            for (int i = first; i < 3; i++) if (CheckCollisionPointRec(GetMousePosition(), fields[i])) d->focus = i;
-        if (IsKeyPressed(KEY_TAB)) d->focus = (d->focus + ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 2 : 1)) % 3;
+            for (int i = first; i < nFields; i++) if (CheckCollisionPointRec(GetMousePosition(), fields[i])) d->focus = i;
+        if (IsKeyPressed(KEY_TAB)) d->focus = (d->focus + ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? nFields - 1 : 1)) % nFields;
         if (d->focus < first) d->focus = first;
         HandleTyping(bufs[d->focus], caps[d->focus]);
-        for (int i = first; i < 3; i++) DrawField(fields[i], bufs[i], hint[i], d->focus == i, SHS_ICON_NONE);
+        for (int i = first; i < nFields; i++) DrawField(fields[i], bufs[i], hint[i], d->focus == i, SHS_ICON_NONE);
 
         if (ButtonI(bSrc, "Browse", SHS_ICON_FOLDER, false, false)) {
             char pick[SHS_DEF_PATH_MAX];
@@ -1182,11 +1802,48 @@ static void DialogDraw(Dialog *d, int W, int H)
     }
 
     if (!d->quick) {
-        DialogCheck(x, y + 196, w, "Mirror: delete files in the target that are not in the source", &d->mirror);
-        DialogCheck(x, y + 232, w, "Auto-sync: watch the source folder and sync changes automatically", &d->autoSync);
+        char incl[200];
+        if (d->src[0]) snprintf(incl, sizeof incl, "Include the folder itself: files go to \"%s\" inside the target", LastFolder(d->src));
+        else           snprintf(incl, sizeof incl, "Include the folder itself, not only the files inside it");
+        DialogCheck(x, y + 196, w, incl, &d->includeFolder);
+        DialogCheck(x, y + 196 + 32, w, "Mirror: delete files in the target that are not in the source", &d->mirror);
+        DialogCheck(x, y + 196 + 64, w, "Auto-sync: watch the source folder and sync changes automatically", &d->autoSync);
+        DialogCheck(x, y + oUsb, w, "USB sync: sync when the target drive is plugged in", &d->usbSync);
+        if (showMark) {                                                  /* only meaningful for a USB task */
+            DialogCheck(x + 28, y + oMark, w - 28, "Mark the USB drive with a hidden ID file (.simplesync-id)", &d->usbMark);
+            ShsDrawText("A small hidden file in the target folder says which stick this is,",
+                        (int)x + 60, (int)(y + oMark + 30), 13, SHS_COLOR_TEXT_MUTED);
+            ShsDrawText(d->usbMark ? "so it is found under any drive letter and other sticks are never used."
+                                   : "Off: nothing is written; any drive with the same letter is used.",
+                        (int)x + 60, (int)(y + oMark + 47), 13, d->usbMark ? SHS_COLOR_TEXT_MUTED : SHS_COLOR_WARNING);
+        }
+        if (d->mirror) {
+            bool was = d->keepDeleted;
+            DialogCheck(x, y + oKeep, w, "Keep removed files: move them to a folder instead of deleting", &d->keepDeleted);
+            if (d->keepDeleted && !was && !d->del[0] && d->dst[0])      /* suggest a folder on the target drive */
+                SuggestDeletedDir(d->src, d->dst, d->del, sizeof d->del);
+            if (d->keepDeleted && !was) d->focus = 3;
+        }
+        if (showDel && ButtonI(bDel, "Browse", SHS_ICON_FOLDER, false, false)) {
+            char pick[SHS_DEF_PATH_MAX];
+            if (ShsPickFolder("Select the folder for removed files", pick, sizeof pick)) snprintf(d->del, sizeof d->del, "%s", pick);
+        }
+        if (showDel && d->drag) DrawField(fDel, d->del, hint[3], d->focus == 3, SHS_ICON_NONE);
+
+        {   /* excluded folders: a summary and a button that opens the panel */
+            const int ne = ExclCount(d->exclude);
+            char sum[200] = "Excluded folders: none", fit[220];
+            if (ne) {
+                char first[SHS_DEF_PATH_MAX];
+                ExclGet(d->exclude, 0, first, sizeof first);
+                snprintf(sum, sizeof sum, ne > 1 ? "Excluded folders: %s and %d more" : "Excluded folders: %s", first, ne - 1);
+            }
+            ShsDrawText(FitTail(fit, sizeof fit, sum, 15, w - 130), (int)x, (int)(y + rowsEnd + 7), 15, SHS_COLOR_TEXT_MAIN);
+            if (ButtonI((Rectangle){ x + w - 110, y + rowsEnd + 2, 110, 32 }, "Manage", SHS_ICON_FOLDER, false, false)) { d->exclOpen = true; d->exclErr[0] = 0; d->exclIn[0] = 0; g_treeReady = false; }
+        }
     }
 
-    if (d->err[0]) ShsDrawText(d->err, (int)x, (int)y + (d->quick ? 204 : 276), 15, SHS_COLOR_DANGER);
+    if (d->err[0]) ShsDrawText(d->err, (int)x, (int)y + (d->quick ? 204 : (int)endY), 15, SHS_COLOR_DANGER);
 
     Rectangle save = { p.x + pw - 24 - 110, p.y + ph - 56, 110, 36 };
     Rectangle cancel = { save.x - 118, save.y, 110, 36 };
@@ -1203,18 +1860,42 @@ static void DialogDraw(Dialog *d, int W, int H)
 
 int main(int argc, char **argv)
 {
-    bool multi = false;                                   /* --multi: allow several copies (for measuring / testing) */
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--multi")) multi = true;
+    bool multi = false, restart = false;                  /* --multi: allow several copies (for measuring / testing) */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--multi")) multi = true;
+        if (!strcmp(argv[i], "--restart")) restart = true;   /* started by a theme switch: the old copy is still closing */
+    }
     g_multi = multi;
-    if (!multi && !ShsSingleInstance()) return 0;        /* already running: it was asked to come to the front */
+    if (!multi) {
+        bool first = ShsSingleInstance();
+        for (int tries = 0; !first && restart && tries < 40; tries++) { ShsSleepMs(100); first = ShsSingleInstance(); }
+        if (!first) return 0;                            /* already running: it was asked to come to the front */
+    }
+
+    snprintf(g_appDir, sizeof g_appDir, "%s", GetApplicationDirectory());
+    for (size_t n = strlen(g_appDir); n > 1 && (g_appDir[n - 1] == '/' || g_appDir[n - 1] == '\\'); ) g_appDir[--n] = 0;
+    {   /* square retro themes are chosen before the window exists: they turn anti-aliasing off and load smaller fonts */
+        char sp[600], ln[96];
+        AppPath(sp, sizeof sp, "simplesync-settings.txt");
+        FILE *sf = fopen(sp, "rb");
+        while (sf && fgets(ln, sizeof ln, sf)) {
+            if (!strncmp(ln, "theme=", 6)) {
+                char nm[32] = "";
+                sscanf(ln + 6, "%31[a-z0-9]", nm);
+                if (ShsThemeFromName(nm) >= SHS_THEME_FLAT98) ShsThemeSetMode(ShsThemeFromName(nm));
+            }
+        }
+        if (sf) fclose(sf);
+    }
 
     /* Undecorated (custom title bar) + high-DPI aware; must be set before InitWindow. */
-    SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE |
-                   FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);   /* MSAA keeps the rounded borders smooth */
+    SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT |
+                   (ShsThemeFlat() ? 0 : FLAG_MSAA_4X_HINT));   /* MSAA keeps the rounded borders smooth; Flat 98 has none */
     InitWindow(1080, 650, SHS_APP_TITLE);
     Image appIcon = LoadImageFromMemory(".png", SHS_ICON_PNG, (int)sizeof SHS_ICON_PNG);
     if (appIcon.data) {
         SetWindowIcon(appIcon);
+        if (ShsThemeFlat()) ImageResize(&appIcon, 128, 128);   /* Flat 98: a small logo texture is plenty */
         g_logo = LoadTextureFromImage(appIcon);          /* title bar logo */
         SetTextureFilter(g_logo, TEXTURE_FILTER_BILINEAR);
         Image gray = ImageCopy(appIcon);                  /* grey logo for paused tasks */
@@ -1229,13 +1910,11 @@ int main(int argc, char **argv)
         UnloadImage(gray);
         UnloadImage(appIcon);
     }
-    ShsRoundWindowCorners(GetWindowHandle());
+    if (!ShsThemeFlat()) ShsRoundWindowCorners(GetWindowHandle());
     SetWindowMinSize(860, 540);
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
 
-    snprintf(g_appDir, sizeof g_appDir, "%s", GetApplicationDirectory());
-    for (size_t n = strlen(g_appDir); n > 1 && (g_appDir[n - 1] == '/' || g_appDir[n - 1] == '\\'); ) g_appDir[--n] = 0;
     AppPath(g_tasksFile, sizeof g_tasksFile, "simplesync-tasks.tsv");
     AppPath(g_debugFile, sizeof g_debugFile, "simplesync-debug.log");
     {   /* keep the debug log small: start a new file once it passes 1 MB */
@@ -1253,7 +1932,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--dev")) CreateSandbox();
         if (!strcmp(argv[i], "--minimized")) g_launchedHidden = true;
         if (!strcmp(argv[i], "--quick") && i + 2 < argc && g_count < MAX_TASKS) {      /* --quick <source> <target>: start a Quick Copy */
-            if (!ValidateTask(argv[i + 1], argv[i + 2])) StartQuickCopy(argv[i + 1], argv[i + 2]);
+            if (!ValidateTask(argv[i + 1], argv[i + 2], NULL)) StartQuickCopy(argv[i + 1], argv[i + 2]);
             i += 2;
         }
         if (!strcmp(argv[i], "--quick-add") && i + 1 < argc && g_count > 0 && g_app[g_count - 1].quick) {   /* dev: same as dropping a path on the card */
@@ -1271,6 +1950,7 @@ int main(int argc, char **argv)
     Dialog dlg = { 0 };
     Filter filter = FILTER_ALL;
     Nav nav = NAV_TASKS;
+    int tasksTab = 0;                                   /* Tasks page tab: 0 Tasks, 1 Quick copies, 2 Schedule, 3 Archive */
     bool sortByStatus = false, searchFocus = false, shouldClose = false, dragging = false;
     char search[64] = "";
     Vector2 dragGrab = { 0 };
@@ -1319,7 +1999,7 @@ int main(int argc, char **argv)
         int conflictTask = -1;                                /* a Quick Copy waiting for "overwrite / skip / keep both" */
         for (int i = 0; i < g_count; i++) if (g_app[i].job && g_app[i].last.conflictPending) { conflictTask = i; break; }
         if (conflictTask >= 0 && g_hidden) ShowFromTray();
-        g_block = dlg.open || conflictTask >= 0;
+        g_block = dlg.open || conflictTask >= 0 || g_del.open;
         Vector2 mouse = Mouse();
         bool maximized = IsWindowMaximized();
 
@@ -1331,12 +2011,26 @@ int main(int argc, char **argv)
                 QuickAddPaths(qi, &fl);
                 UnloadDroppedFiles(fl);
             } else {
-                DialogOpen(&dlg, -1); nav = NAV_TASKS;                         /* a folder dropped on the window starts a new task */
+                FilePathList fl = LoadDroppedFiles();
+                nav = NAV_TASKS;
+                if (fl.count > 0 && DirectoryExists(fl.paths[0])) {            /* a folder dropped on the window: Quick Copy, so the folder itself lands in the target */
+                    DialogOpenQuick(&dlg);
+                    snprintf(dlg.src, sizeof dlg.src, "%s", fl.paths[0]);
+                } else if (fl.count > 0) {                                     /* a file: a new task for its folder */
+                    DialogOpen(&dlg, -1);
+                    snprintf(dlg.src, sizeof dlg.src, "%s", GetDirectoryPath(fl.paths[0]));
+                    snprintf(dlg.name, sizeof dlg.name, "%s", LastFolder(dlg.src));
+                }
+                UnloadDroppedFiles(fl);
             }
         }
         ShsThemeUpdate();
+        ShsFontsCheckDpi();
         PollJobs();
         WatchTasks();
+        UsbTasks();
+        UpdateTick();
+        PurgeTick();
         for (int i = 0; i < g_count; i++)                                       /* unattended Quick Copy: remove the finished card */
             if (g_app[i].quick && g_app[i].dismissAt > 0 && !g_app[i].job && GetTime() >= g_app[i].dismissAt) {
                 RemoveTask(i);
@@ -1349,6 +2043,13 @@ int main(int argc, char **argv)
         for (int i = 0; i < g_count; i++) {
             BuildView(&g_app[i], &views[i]);
             views[i].id = i;
+            if (!views[i].quick && view.sumSel[i] > 0 && view.sumSel[i] <= 4) {      /* a summary tab is picked: size the panel to its list */
+                static const int TAB_FILTER[4] = { 2, 4, 3, 5 };                     /* copied, removed, errors, temp files skipped */
+                ShsTaskRow none[1];
+                int total = 0;
+                QueryRows(&g_app[i], TAB_FILTER[view.sumSel[i] - 1], 0, 0, none, &total);
+                views[i].selRows = total < 1 ? 1 : (total > 8 ? 8 : total);
+            }
             switch (views[i].state) {
                 case SHS_TASK_SYNCING: nActive++; totalRate += views[i].rateMBps; break;
                 case SHS_TASK_IDLE:    nIdle++;   break;
@@ -1359,7 +2060,7 @@ int main(int argc, char **argv)
 
         if (skipDraw) {                                           /* idle: the logic above still ran; just wait for events */
             PollInputEvents();
-            ShsSleepMs(50);                                       /* not WaitTime(): raylib busy-waits at the end of it */
+            ShsSleepMs(10);                                       /* not WaitTime(): raylib busy-waits at the end of it. Short, so a quick click (press and release between two polls) is not lost: that made the close button flaky */
             continue;
         }
         BeginDrawing();
@@ -1368,12 +2069,18 @@ int main(int argc, char **argv)
         FillRound((Rectangle){ 0, 0, (float)W, (float)H }, g_winR, SHS_COLOR_BG);
 
         /* ================= title bar ================= */
-        FillRoundTop((Rectangle){ 0, 0, (float)W, TITLEBAR_H }, g_winR, SHS_COLOR_TITLEBAR);
+        if (ShsThemeClassic()) {
+            ShsDrawTitleBar(W, TITLEBAR_H);
+            Color bk = ShsThemeTitleBack();
+            if (bk.a) DrawRectangle(8, 8, ShsMeasureText(SHS_APP_TITLE, 19) + 54, TITLEBAR_H - 16, bk);          /* patch under logo and title on striped bars */
+        } else FillRoundTop((Rectangle){ 0, 0, (float)W, TITLEBAR_H }, g_winR, SHS_COLOR_TITLEBAR);
         if (g_logo.id) {
             DrawTexturePro(g_logo, (Rectangle){ 0, 0, (float)g_logo.width, (float)g_logo.height },
                            (Rectangle){ 14, 10, 28, 28 }, (Vector2){ 0, 0 }, 0.0f, WHITE);
         }
-        ShsDrawText("SailHighSea SimpleSync", 52, 14, 19, SHS_COLOR_ON_PRIMARY);
+        const Color titleInk = ShsThemeClassic() ? ShsThemeTitleInk() : SHS_COLOR_ON_PRIMARY;
+        ShsDrawText(SHS_APP_TITLE, 52, 14, 19, titleInk);
+        if (ShsThemeFauxBold()) ShsDrawText(SHS_APP_TITLE, 53, 14, 19, titleInk);      /* faux bold */
 
         /* window buttons: 36 x 32 with 6 px gaps and a 12 px right margin, vertically centred in the bar */
         const float wbW = 36, wbH = 32, wbGap = 6, wbY = (TITLEBAR_H - wbH) / 2;
@@ -1389,10 +2096,18 @@ int main(int argc, char **argv)
 
 
         bool hMin = CheckCollisionPointRec(mouse, minB), hMax = CheckCollisionPointRec(mouse, maxB), hClose = CheckCollisionPointRec(mouse, closeB);
-        if (hMin)   DrawRectangleRounded(minB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
-        if (hMax)   DrawRectangleRounded(maxB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
-        if (hClose) DrawRectangleRounded(closeB, 0.4f, 10, SHS_COLOR_DANGER);
-        const Color wInk = SHS_COLOR_ON_PRIMARY;
+        const bool flat98 = ShsThemeClassic();
+        if (flat98) {                                    /* Win98 caption buttons: grey squares with a 1 px border and black glyphs */
+            const Rectangle wbs[3] = { minB, maxB, closeB };
+            const bool wbHot[3] = { hMin, hMax, hClose };
+            for (int i = 0; i < 3; i++)
+                ShsDrawButtonBox(wbs[i], ShsThemeFlat() ? 0.0f : 6.0f, (wbHot[i] && !ShsThemeBevel()) ? (i == 2 ? SHS_COLOR_DANGER : SHS_COLOR_CARD_HOVER) : SHS_COLOR_BG, SHS_COLOR_BORDER, wbHot[i] && IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        } else {
+            if (hMin)   ShsRoundRec(minB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
+            if (hMax)   ShsRoundRec(maxB,   0.4f, 10, Fade(SHS_COLOR_ON_PRIMARY, 0.18f));
+            if (hClose) ShsRoundRec(closeB, 0.4f, 10, SHS_COLOR_DANGER);
+        }
+        const Color wInk = flat98 ? ((hClose && !ShsThemeBevel()) ? SHS_COLOR_ON_PRIMARY : SHS_COLOR_TEXT_MAIN) : SHS_COLOR_ON_PRIMARY;
         const float mcx = minB.x + wbW / 2,   mcy = minB.y + wbH / 2;
         const float xcx = maxB.x + wbW / 2,   xcy = maxB.y + wbH / 2;
         const float ccx = closeB.x + wbW / 2, ccy = closeB.y + wbH / 2;
@@ -1425,34 +2140,43 @@ int main(int argc, char **argv)
 
         /* ================= sidebar ================= */
         Rectangle side = { 0, TITLEBAR_H, SIDEBAR_W, (float)(H - TITLEBAR_H - STATUSBAR_H) };
-        DrawRectangleRec(side, SHS_COLOR_CARD);
+        DrawRectangleRec(side, ShsThemeClassic() ? SHS_COLOR_BG : SHS_COLOR_CARD);
         DrawRectangle(SIDEBAR_W - 1, TITLEBAR_H, 1, (int)side.height, SHS_COLOR_BORDER);
 
-        if (ButtonI((Rectangle){ 16, TITLEBAR_H + 16, SIDEBAR_W - 32, 38 }, "Add Task", SHS_ICON_PLUS, true, false)) {
-            DialogOpen(&dlg, -1);
-            nav = NAV_TASKS;
+        {   /* a newly added card brings its tab to the front */
+            static int prevCount = 0;
+            if (g_count > prevCount) { tasksTab = g_app[g_count - 1].quick ? 1 : 0; nav = NAV_TASKS; }
+            prevCount = g_count;
         }
-        if (ButtonI((Rectangle){ 16, TITLEBAR_H + 62, SIDEBAR_W - 32, 34 }, "Quick Copy", SHS_ICON_COPY, false, false)) {
-            DialogOpenQuick(&dlg);                       /* one-off copy: nothing is saved */
-            nav = NAV_TASKS;
-        }
-        ShsDrawText("NAVIGATION", 20, TITLEBAR_H + 118, 12, SHS_COLOR_TEXT_MUTED);
-        DrawRectangle(20, TITLEBAR_H + 136, SIDEBAR_W - 40, 1, SHS_COLOR_BORDER);
-        for (int i = 0; i < NAV_COUNT; i++) {
-            Rectangle r = { 10, (float)(TITLEBAR_H + 146 + i * 40), SIDEBAR_W - 20, 36 };
-            bool hot = CheckCollisionPointRec(mouse, r);
-            bool on = (int)nav == i;
-            if (on)        DrawRectangleRounded(r, 0.25f, 8, Fade(SHS_COLOR_PRIMARY, 0.25f));
-            else if (hot)  DrawRectangleRounded(r, 0.25f, 8, SHS_COLOR_CARD_HOVER);
-            if (on)        DrawRectangle(10, (int)r.y + 8, 3, 20, SHS_COLOR_PRIMARY);
-            char label[48];
-            if (i == NAV_TASKS) snprintf(label, sizeof label, "%s (%d)", NAV_LABEL[i], g_count);
-            else                snprintf(label, sizeof label, "%s", NAV_LABEL[i]);
+        const char *railTip = NULL;
+        float railTipY = 0;
+        {
+            const float bs = 40, bx = (SIDEBAR_W - bs) / 2;
+            Rectangle addB = { bx, (float)TITLEBAR_H + 12, bs, bs }, quickB = { bx, (float)TITLEBAR_H + 60, bs, bs };
+            if (ButtonI(addB, "", SHS_ICON_PLUS, true, false)) { DialogOpen(&dlg, -1); nav = NAV_TASKS; tasksTab = 0; }
+            if (ButtonI(quickB, "", SHS_ICON_COPY, false, false)) { DialogOpenQuick(&dlg); nav = NAV_TASKS; tasksTab = 1; }   /* one-off copy: nothing is saved */
+            if (CheckCollisionPointRec(mouse, addB))   { railTip = "Add Task";   railTipY = addB.y + bs / 2; }
+            if (CheckCollisionPointRec(mouse, quickB)) { railTip = "Quick Copy"; railTipY = quickB.y + bs / 2; }
+            DrawRectangle(14, TITLEBAR_H + 112, SIDEBAR_W - 28, 1, SHS_COLOR_BORDER);
             static const ShsIcon navIcon[NAV_COUNT] = { SHS_ICON_TASKS, SHS_ICON_TRAFFIC, SHS_ICON_LOGS, SHS_ICON_GEAR, SHS_ICON_INFO };
-            Color navInk = on ? SHS_COLOR_TEXT_MAIN : SHS_COLOR_TEXT_MUTED;
-            ShsDrawIcon(navIcon[i], 36, r.y + r.height / 2, 18.0f, on ? SHS_COLOR_PRIMARY : navInk);
-            ShsDrawText(label, 54, (int)r.y + 10, 16, navInk);
-            if (hot && Pressed()) nav = (Nav)i;
+            for (int i = 0; i < NAV_COUNT; i++) {
+                Rectangle r = { bx, (float)(TITLEBAR_H + 124 + i * 48), bs, bs };
+                bool hot = CheckCollisionPointRec(mouse, r), on = (int)nav == i;
+                if (ShsThemeBevel()) ShsDrawBevel(r, on || (hot && !g_block && IsMouseButtonDown(MOUSE_BUTTON_LEFT)), SHS_COLOR_BG);
+                else {
+                    if (on)       ShsRoundRec(r, 0.25f, 8, Fade(SHS_COLOR_PRIMARY, 0.25f));
+                    else if (hot) ShsRoundRec(r, 0.25f, 8, SHS_COLOR_CARD_HOVER);
+                    if (on)       DrawRectangle(0, (int)r.y + 10, 3, 20, SHS_COLOR_PRIMARY);
+                }
+                ShsDrawIcon(navIcon[i], r.x + bs / 2, r.y + bs / 2, 20.0f, on ? SHS_COLOR_PRIMARY : SHS_COLOR_TEXT_MUTED);
+                if (hot) {
+                    static char tipBuf[48];
+                    if (i == NAV_TASKS) snprintf(tipBuf, sizeof tipBuf, "%s (%d)", NAV_LABEL[i], g_count);
+                    else                snprintf(tipBuf, sizeof tipBuf, "%s", NAV_LABEL[i]);
+                    railTip = tipBuf; railTipY = r.y + bs / 2;
+                    if (Pressed()) nav = (Nav)i;
+                }
+            }
         }
 
         /* ================= main pane ================= */
@@ -1460,9 +2184,34 @@ int main(int argc, char **argv)
         float py = TITLEBAR_H + 16;
 
         if (nav == NAV_TASKS) {
-            char sum[128];
-            snprintf(sum, sizeof sum, "GLOBAL SUMMARY: %d Active  |  %d Idle  |  %d Alert  |  %d Paused", nActive, nIdle, nErr, nPaused);
-            ShsDrawText(sum, (int)px, (int)py + 9, 15, SHS_COLOR_TEXT_MAIN);
+            Rectangle activeTabR = { 0 };                       /* Win98: the selected tab is drawn over the divider */
+            int nQuick = 0;
+            for (int i = 0; i < g_count; i++) if (g_app[i].quick) nQuick++;
+            {   /* page tabs */
+                char tl[4][32];
+                snprintf(tl[0], sizeof tl[0], "Tasks (%d)", g_count - nQuick);
+                snprintf(tl[1], sizeof tl[1], "Quick copies (%d)", nQuick);
+                snprintf(tl[2], sizeof tl[2], "Schedule");
+                snprintf(tl[3], sizeof tl[3], "Archive");
+                float tx = px;
+                for (int i = 0; i < 4; i++) {
+                    float tw = (float)ShsMeasureText(tl[i], 17) + 28;
+                    Rectangle tr = { tx, py, tw, 38 };
+                    bool hot = CheckCollisionPointRec(mouse, tr), on = tasksTab == i;
+                    Color tabInk = on ? SHS_COLOR_PRIMARY : SHS_COLOR_TEXT_MUTED;
+                    int tabTextY = (int)py + 9;
+                    if (ShsThemeFolderTabs() || ShsThemeBevel()) {       /* retro themes: folder tabs, the selected one a little taller */
+                        Rectangle bt = on ? (Rectangle){ tx, py + 1, tw, 40 } : (Rectangle){ tx, py + 5, tw, 34 };
+                        tabInk = ShsDrawTab(bt, on);
+                        if (on) activeTabR = bt;
+                        tabTextY = (int)py + (on ? 9 : 12);
+                    } else if (hot && !on) ShsRoundRec((Rectangle){ tr.x, tr.y + 2, tr.width, 32 }, 0.25f, 8, SHS_COLOR_CARD_HOVER);
+                    ShsDrawText(tl[i], (int)(tx + 14), tabTextY, 17, tabInk);
+                    if (on && !ShsThemeFolderTabs() && !ShsThemeBevel()) DrawRectangle((int)tx, (int)py + 36, (int)tw, 3, SHS_COLOR_PRIMARY);
+                    if (hot && Pressed()) { tasksTab = i; view.scrollTarget = 0; }
+                    tx += tw + 6;
+                }
+            }
             Rectangle syncAll = { px + pw - 110, py, 110, 32 };
             Rectangle pauseAll = { syncAll.x - 126, py, 118, 32 };
             if (ButtonI(pauseAll, "Pause All", SHS_ICON_PAUSE, false, false))
@@ -1473,27 +2222,43 @@ int main(int argc, char **argv)
                     else if (!g_app[i].quick) StartTask(i);
                 }
             }
-            DrawRectangle((int)px, (int)py + 42, (int)pw, 1, SHS_COLOR_BORDER);
+            DrawRectangle((int)px, (int)py + 38, (int)pw, 1, SHS_COLOR_BORDER);
+            if (ShsThemeBevel()) DrawRectangle((int)px, (int)py + 39, (int)pw, 1, WHITE);
+            if (activeTabR.width > 0) DrawRectangle((int)activeTabR.x + 2, (int)py + 38, (int)activeTabR.width - 4, 3, ShsThemeTabFill());     /* open the active tab into the page */
 
-            struct { const char *name; int count; } fl[4] = {
-                { "All", g_count }, { "Active", nActive }, { "Errors", nErr }, { "Paused", nPaused } };
-            float fx = px, fy = py + 54;
-            ShsDrawText("FILTERS:", (int)fx, (int)fy + 8, 13, SHS_COLOR_TEXT_MUTED);
-            fx += 80;
-            static const ShsIcon filterIcon[4] = { SHS_ICON_GRID, SHS_ICON_SYNC, SHS_ICON_WARN, SHS_ICON_PAUSE };
-            for (int i = 0; i < 4; i++) {
-                char lb[32];
-                snprintf(lb, sizeof lb, "%s (%d)", fl[i].name, fl[i].count);
-                float bw = (float)ShsMeasureText(lb, 15) + 28 + 24;
-                if (ButtonI((Rectangle){ fx, fy, bw, 30 }, lb, filterIcon[i], false, filter == (Filter)i)) { filter = (Filter)i; view.scrollTarget = 0; }
-                fx += bw + 8;
+            const bool listTab = tasksTab < 2;
+            int tabAll = 0, tabActive = 0, tabErr = 0, tabPaused = 0;      /* counts for the current tab */
+            for (int i = 0; i < g_count; i++) {
+                if (g_app[i].quick != (tasksTab == 1)) continue;
+                tabAll++;
+                switch (views[i].state) {
+                    case SHS_TASK_SYNCING: tabActive++; break;
+                    case SHS_TASK_ERROR:   tabErr++; break;
+                    case SHS_TASK_PAUSED:  tabPaused++; break;
+                    default: break;
+                }
             }
-            DrawRectangle((int)px, (int)fy + 40, (int)pw, 1, SHS_COLOR_BORDER);
-
-            float hy = fy + 52;
-            ShsDrawText("SYNC TASK LIST / RULES", (int)px, (int)hy + 8, 13, SHS_COLOR_TEXT_MUTED);
-            if (ButtonI((Rectangle){ px + pw - 160, hy, 160, 30 }, sortByStatus ? "Sorted by Status" : "Sort by Status", SHS_ICON_SORT, false, sortByStatus))
-                sortByStatus = !sortByStatus;
+            struct { const char *name; int count; } fl[4] = {
+                { "All", tabAll }, { "Active", tabActive }, { "Errors", tabErr }, { "Paused", tabPaused } };
+            float fx = px, fy = py + 50;
+            if (listTab) {
+                ShsDrawText("Filter:", (int)fx, (int)fy + 8, 14, SHS_COLOR_TEXT_MUTED);
+                fx += 56;
+                static const ShsIcon filterIcon[4] = { SHS_ICON_GRID, SHS_ICON_SYNC, SHS_ICON_WARN, SHS_ICON_PAUSE };
+                for (int i = 0; i < 4; i++) {
+                    char lb[32];
+                    snprintf(lb, sizeof lb, "%s (%d)", fl[i].name, fl[i].count);
+                    float bw = (float)ShsMeasureText(lb, 15) + 28 + 24;
+                    if (ButtonI((Rectangle){ fx, fy, bw, 30 }, lb, filterIcon[i], false, filter == (Filter)i)) { filter = (Filter)i; view.scrollTarget = 0; }
+                    fx += bw + 8;
+                }
+                if (ButtonI((Rectangle){ px + pw - 160, fy, 160, 30 }, sortByStatus ? "Sorted by Status" : "Sort by Status", SHS_ICON_SORT, false, sortByStatus))
+                    sortByStatus = !sortByStatus;
+            } else {
+                ShsDrawText(tasksTab == 2 ? "Scheduled syncs are not available yet." : "Archived tasks are not available yet.",
+                            (int)px + 8, (int)fy + 16, 16, SHS_COLOR_TEXT_MUTED);
+            }
+            float hy = fy - 2;                       /* the list starts 42 below this */
 
             /* filtered (and optionally sorted) copy; shownIdx maps back to g_app */
             static ShsTask shown[MAX_TASKS];
@@ -1503,6 +2268,7 @@ int main(int argc, char **argv)
                 for (int i = 0; i < g_count; i++) {
                     const ShsTask *t = &views[i];
                     if (sortByStatus && StatusRank(t->state) != pass) continue;
+                    if (!listTab || g_app[i].quick != (tasksTab == 1)) continue;
                     bool ok = filter == FILTER_ALL ||
                               (filter == FILTER_ACTIVE && t->state == SHS_TASK_SYNCING) ||
                               (filter == FILTER_ERRORS && t->state == SHS_TASK_ERROR) ||
@@ -1551,7 +2317,10 @@ int main(int argc, char **argv)
                         SaveTasks();
                         LogAdd("%s: auto-sync %s", a->def.name, a->def.autoSync ? "on" : "off");
                         break;
-                    case SHS_ACT_REMOVE: RemoveTask(ti); ShsTaskViewRemoved(&view, ti); break;
+                    case SHS_ACT_REMOVE:
+                        if (a->quick) { RemoveTask(ti); ShsTaskViewRemoved(&view, ti); }                 /* a Quick Copy card is just dismissed */
+                        else          { g_del = (DeleteDialog){ true, ti, false, "" }; }              /* a task: ask first, and about its files */
+                        break;
                     case SHS_ACT_ADD_FOLDER: {
                         char picked[SHS_DEF_PATH_MAX] = "";
                         if (ShsPickFolder("Add a folder to this copy", picked, sizeof picked) && picked[0]) {
@@ -1569,8 +2338,13 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (shownCount == 0 && g_count == 0)
-                ShsDrawText("Click \"+ Add Task\" to create your first sync task.", (int)px + 8, (int)listB.y + 40, 16, SHS_COLOR_TEXT_MUTED);        } else {
+            if (listTab && shownCount == 0) {
+                const char *none = tabAll > 0 ? "Nothing matches the current filter or search."
+                                 : (tasksTab == 1 ? "No quick copies. Use the copy button on the left to start one."
+                                                  : "Click the + button on the left to create your first sync task.");
+                ShsDrawText(none, (int)px + 8, (int)listB.y + 16, 16, SHS_COLOR_TEXT_MUTED);
+            }
+        } else {
             ShsDrawText(NAV_LABEL[nav], (int)px, (int)py, 26, SHS_COLOR_TEXT_MAIN);
             if (nav == NAV_LOGS) {
                 ShsDrawText("Full debug log: simplesync-debug.log, next to the app", (int)px + 160, (int)py + 11, 13, SHS_COLOR_TEXT_MUTED);
@@ -1596,18 +2370,32 @@ int main(int argc, char **argv)
                     y += 22;
                 }
             } else if (nav == NAV_SETTINGS) {
+                const float viewTop = y - 8, viewBot = (float)(H - STATUSBAR_H);       /* the page scrolls inside this band */
+                if (!g_block && !dlg.open) g_setScroll -= GetMouseWheelMove() * 48.0f;
+                if (g_setScroll > g_setMax) g_setScroll = g_setMax;
+                if (g_setScroll < 0) g_setScroll = 0;
+                BeginScissorMode(0, (int)viewTop, W, (int)(viewBot - viewTop));
+                const bool prevBlock = g_block;                                        /* scrolled-off widgets must not take clicks */
+                const Vector2 mp = GetMousePosition();
+                if (mp.y < viewTop || mp.y > viewBot) g_block = true;
+                const float contentTop = y;
+                y -= g_setScroll;
                 ShsDrawText("APPEARANCE", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
-                static const char *const modeName[3] = { "System", "Light", "Dark" };
-                for (int m = 0; m < 3; m++) {
-                    if (Button((Rectangle){ px + m * 110, y + 22, 100, 34 }, modeName[m], false, (int)ShsThemeGetMode() == m)) {
+                for (int m = 0; m < SHS_THEME_COUNT; m++) {                 /* two rows of theme buttons */
+                    const float bwid = 120;
+                    int col = m < 5 ? m : m - 5, row = m < 5 ? 0 : 1;
+                    if (Button((Rectangle){ px + col * (bwid + 8), y + 22 + row * 40, bwid, 34 }, ShsThemeLabel((ShsThemeMode)m), false, (int)ShsThemeGetMode() == m)) {
+                        bool wasFlat = ShsThemeFlat();
                         ShsThemeSetMode((ShsThemeMode)m);
                         SaveSettings();
+                        if (wasFlat != ShsThemeFlat()) { g_restart = true; shouldClose = true; }   /* anti-aliasing and fonts are fixed at start-up */
                     }
                 }
                 char look[96];
-                snprintf(look, sizeof look, "Using the %s theme", ShsThemeIsDark() ? "dark" : "light");
-                ShsDrawText(look, (int)px + 340, (int)y + 31, 14, SHS_COLOR_TEXT_MUTED);
-                y += 84;
+                snprintf(look, sizeof look, "Using the %s theme", ShsThemeClassic() ? ShsThemeLabel(ShsThemeGetMode()) : (ShsThemeIsDark() ? "dark" : "light"));
+                ShsDrawText(look, (int)px + 5 * 128 + 8, (int)y + 31, 14, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Themes with square corners (Flat 98, Win98, Mac System 7, Linux CDE) restart the app when you switch to or from them. They use less memory.", (int)px, (int)y + 102, 13, SHS_COLOR_TEXT_MUTED);
+                y += 124;
 
                 ShsDrawText("STARTUP", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
                 float ty = y + 24;
@@ -1636,6 +2424,26 @@ int main(int argc, char **argv)
                 }
                 y = ty + 6;
 
+                ShsDrawText("UPDATES", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
+                v = g_checkUpdates;
+                if (Toggle(px, y + 24, 640, "Check for updates automatically", "Looks for a newer release on GitHub at start-up and once a day, and tells you in the status bar", &v)) {
+                    g_checkUpdates = v;
+                    g_nextUpdateCheck = 0;
+                    SaveSettings();
+                }
+                v = g_updateDev;
+                if (Toggle(px, y + 78, 640, "Include dev builds", "Also tell me about pre-release dev builds (newer features, may be unstable)", &v)) {
+                    g_updateDev = v;
+                    g_updateFound = false;
+                    g_updateMsg[0] = 0;
+                    g_nextUpdateCheck = 0;
+                    SaveSettings();
+                }
+                if (Button((Rectangle){ px, y + 134, 140, 32 }, "Check now", false, false)) UpdateCheckNow(true);
+                if (g_updateMsg[0]) ShsDrawText(g_updateMsg, (int)px + 156, (int)y + 142, 14, g_updateFound ? SHS_COLOR_PRIMARY : SHS_COLOR_TEXT_MUTED);
+                if (g_updateFound && Button((Rectangle){ px + 156 + ShsMeasureText(g_updateMsg, 14) + 16, y + 134, 140, 32 }, "Download", true, false)) ShsOpenUrl(g_updateUrl);
+                y += 182;
+
                 ShsDrawText("COPY PERFORMANCE", (int)px, (int)y, 12, SHS_COLOR_TEXT_MUTED);
                 char tv[24];
                 snprintf(tv, sizeof tv, "%d", g_copyThreads);
@@ -1652,7 +2460,11 @@ int main(int argc, char **argv)
                 if (ButtonI((Rectangle){ px, y, 270, 34 }, "Create / reset test sandbox", SHS_ICON_FOLDER, true, false)) CreateSandbox();
                 ShsDrawText("Test folders next to the program, for trying the app on copies instead of real data.", (int)px + 286, (int)y + 9, 13, SHS_COLOR_TEXT_MUTED);
                 ShsDrawText("Mirror tasks permanently delete files in the target that are missing from the source.",
-                            (int)px, (int)y + 46, 13, SHS_COLOR_WARNING);            } else if (nav == NAV_ABOUT) {
+                            (int)px, (int)y + 46, 13, SHS_COLOR_WARNING);
+                EndScissorMode();
+                g_block = prevBlock;
+                g_setMax = fmaxf(0.0f, (y + 46 + 24 + g_setScroll) - contentTop - (viewBot - contentTop));
+            } else if (nav == NAV_ABOUT) {
                 /* header: icon, name, version, tagline */
                 const float icon = 96.0f, tx = px + icon + 24.0f;
                 if (g_logo.id)
@@ -1663,8 +2475,9 @@ int main(int argc, char **argv)
                 ShsDrawText("A tiny, portable, open-source folder sync tool.", (int)tx, (int)y + 68, 15, SHS_COLOR_TEXT_MUTED);
 
                 float cy = y + icon + 24.0f;
-                ShsDrawText("Copies new and changed files from a source folder to a target, with live progress.", (int)px, (int)cy, 15, SHS_COLOR_TEXT_MUTED);
-                ShsDrawText("Mirror mode also removes files from the target that are missing in the source.", (int)px, (int)cy + 24, 15, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Keeps a target folder in step with a source folder, copying only what is new or changed.", (int)px, (int)cy, 15, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Run a task by hand, when the source changes (Auto-sync), or when a USB drive is plugged in.", (int)px, (int)cy + 22, 15, SHS_COLOR_TEXT_MUTED);
+                ShsDrawText("Mirror mode keeps the target identical, and can move removed files to a \"-deleted\" folder instead.", (int)px, (int)cy + 44, 15, SHS_COLOR_TEXT_MUTED);
 
                 /* details card */
                 const float cw = fminf(pw, 760.0f), rowH = 32.0f;
@@ -1680,7 +2493,7 @@ int main(int argc, char **argv)
                     { "Data folder", NULL },
                 };
                 const int nRows = (int)(sizeof rows / sizeof rows[0]);
-                Rectangle card = { px, cy + 62, cw, rowH * nRows + 20 };
+                Rectangle card = { px, cy + 76, cw, rowH * nRows + 20 };
                 ShsDrawRoundedBox(card, 14.0f, SHS_COLOR_CARD, SHS_COLOR_BORDER);
                 for (int i = 0; i < nRows; i++) {
                     float ry = card.y + 10 + i * rowH;
@@ -1714,6 +2527,13 @@ int main(int argc, char **argv)
             }
         }
 
+        if (railTip && !g_block) {                       /* icon rail tooltip, drawn over the page */
+            int tw = ShsMeasureText(railTip, 15);
+            Rectangle tr = { SIDEBAR_W + 4, railTipY - 14, (float)tw + 20, 28 };
+            ShsDrawRoundedBox(tr, 7.0f, SHS_COLOR_CARD, SHS_COLOR_BORDER);
+            ShsDrawText(railTip, (int)tr.x + 10, (int)tr.y + 6, 15, SHS_COLOR_TEXT_MAIN);
+        }
+
         /* tray tooltip follows the sync state */
         if (ShsTrayActive()) {
             static char lastTip[96] = "";
@@ -1725,8 +2545,16 @@ int main(int argc, char **argv)
         }
 
         /* ================= status bar ================= */
-        FillRoundBottom((Rectangle){ 0, (float)(H - STATUSBAR_H), (float)W, STATUSBAR_H }, g_winR, SHS_COLOR_CARD);
+        FillRoundBottom((Rectangle){ 0, (float)(H - STATUSBAR_H), (float)W, STATUSBAR_H }, g_winR, ShsThemeClassic() ? SHS_COLOR_BG : SHS_COLOR_CARD);
         DrawRectangle(0, H - STATUSBAR_H, W, 1, SHS_COLOR_BORDER);
+        if (ShsThemeBevel()) {                                      /* Win98: sunken status panels */
+            const float spy = (float)(H - STATUSBAR_H + 3), sph = STATUSBAR_H - 5;
+            const float verW = (float)ShsMeasureText("SailHighSea Engine v" SHS_VERSION, 14);
+            ShsDrawBevelFrame((Rectangle){ 4, spy, 218, sph }, true);
+            ShsDrawBevelFrame((Rectangle){ 224, spy, 196, sph }, true);
+            ShsDrawBevelFrame((Rectangle){ 424, spy, 230, sph }, true);
+            ShsDrawBevelFrame((Rectangle){ (float)W - verW - 30, spy, verW + 26, sph }, true);
+        }
         int sy = H - STATUSBAR_H + 8;
         DrawCircle(20, H - STATUSBAR_H / 2, 4.5f, nActive ? SHS_COLOR_PRIMARY : SHS_COLOR_SUCCESS);
         ShsDrawText(nActive ? "Engine Status: SYNCING" : "Engine Status: READY", 32, sy, 14, SHS_COLOR_TEXT_MAIN);
@@ -1742,21 +2570,45 @@ int main(int argc, char **argv)
         ShsDrawText(disk, 430, sy, 14, SHS_COLOR_TEXT_MUTED);
         const char *ver = "SailHighSea Engine v" SHS_VERSION;
         ShsDrawText(ver, W - ShsMeasureText(ver, 14) - 16, sy, 14, SHS_COLOR_TEXT_MUTED);
+        if (g_updateFound) {                                                   /* newer release: click to open its page */
+            char un[96];
+            const float rightEdge = (float)(W - ShsMeasureText(ver, 14) - 40);                         /* keep clear of the free-disk text / panel on the left */
+            const float leftLimit = ShsThemeBevel() ? 662.0f : 430.0f + ShsMeasureText(disk, 14) + 20.0f;
+            snprintf(un, sizeof un, "Update available: %s - click to download", g_updateTag);
+            if (rightEdge - ShsMeasureText(un, 14) < leftLimit) snprintf(un, sizeof un, "Update available: %s", g_updateTag);
+            if (rightEdge - ShsMeasureText(un, 14) < leftLimit) snprintf(un, sizeof un, "Update %s", g_updateTag);
+            const int uw = ShsMeasureText(un, 14), ux = (int)rightEdge - uw;
+            Rectangle ur = { (float)ux - 6, (float)(H - STATUSBAR_H), (float)uw + 12, STATUSBAR_H };
+            bool hot = !dlg.open && CheckCollisionPointRec(GetMousePosition(), ur);
+            ShsDrawText(un, ux, sy, 14, SHS_COLOR_PRIMARY);
+            if (hot) { SetMouseCursor(MOUSE_CURSOR_POINTING_HAND); if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) ShsOpenUrl(g_updateUrl); }
+        }
 
         if (dlg.open) DialogDraw(&dlg, W, H);
         if (conflictTask >= 0 && g_app[conflictTask].job) ConflictDraw(conflictTask, W, H);
+        if (g_del.open) {
+            if (g_del.idx >= g_count || g_app[g_del.idx].quick) g_del.open = false;
+            else {
+                int dr = DeleteDraw(W, H);
+                if (dr == 1) g_del.open = false;
+                else if (dr == 2 && DeleteConfirm()) { RemoveTask(g_del.idx); ShsTaskViewRemoved(&view, g_del.idx); g_del.open = false; }
+            }
+        }
         g_block = false;
 
-        if (g_winR >= 0.5f) DrawRectangleRoundedLinesEx((Rectangle){ 0, 0, (float)W, (float)H }, RoundNess((Rectangle){ 0, 0, (float)W, (float)H }, g_winR), 16, 1.0f, SHS_COLOR_BORDER);
+        if (g_winR >= 0.5f) ShsRoundLines((Rectangle){ 0, 0, (float)W, (float)H }, RoundNess((Rectangle){ 0, 0, (float)W, (float)H }, g_winR), 16, 1.0f, SHS_COLOR_BORDER);
+        else if (ShsThemeBevel()) ShsDrawBevelFrame((Rectangle){ 0, 0, (float)W, (float)H }, false);
         else                DrawRectangleLines(0, 0, W, H, SHS_COLOR_BORDER);   /* no OS frame */
         EndDrawing();
     }
 
     for (int i = 0; i < g_count; i++) { StopWatch(i); if (g_app[i].job) { ShsSyncFree(g_app[i].job); g_app[i].job = NULL; } }
+    ShsPurgeFree(g_purge);                                  /* stops a deletion that is still running */
     ShsTrayDestroy();
     ShsFontsShutdown();
     if (g_logo.id) UnloadTexture(g_logo);
     if (g_logoGray.id) UnloadTexture(g_logoGray);
     CloseWindow();
+    if (g_restart) ShsRelaunch(argc, argv);
     return 0;
 }

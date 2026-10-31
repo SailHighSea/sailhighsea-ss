@@ -42,15 +42,38 @@ bool ShsSingleInstance(void);
    again on demand. Call when the app has been idle for a while. No-op elsewhere. */
 void ShsTrimMemory(void);
 
+/* Starts a fresh copy of this program (same arguments plus --restart, which makes it wait for this copy to exit). Returns false on failure. */
+bool ShsRelaunch(int argc, char **argv);
+
 /* Sleeps without spinning (unlike raylib's WaitTime, which busy-waits for its last few percent). */
 void ShsSleepMs(unsigned ms);
 int  ShsTrayPoll(void);                     /* returns and clears the SHS_TRAY_* events since the last call */
 
 /* ---- folder watcher: tells the app when anything under a folder changed ---- */
 typedef struct ShsWatch ShsWatch;
-ShsWatch *ShsWatchStart(const char *folder);   /* NULL if the folder cannot be watched */
+ShsWatch *ShsWatchStart(const char *folder, const char *excludes);   /* NULL if the folder cannot be watched; changes inside the excluded folders ("name|sub/path|...", may be NULL) are ignored */
+bool      ShsWatchExcluded(const char *excludes, const char *rel);
 bool      ShsWatchTake(ShsWatch *w);           /* true once per burst of changes since the last call */
 void      ShsWatchStop(ShsWatch *w);
+
+/* ---- removable drives ---- */
+/* The volume that holds `path`: "E:\" on Windows, "\\server\share", "/Volumes/NAME", "/media/user/NAME", "/mnt/NAME".
+   False when the path is not on a volume that can come and go (e.g. a plain "/home/..." folder). */
+bool ShsVolumeRoot(const char *path, char *out, size_t cap);
+/* True while the volume is connected and readable. Cheap enough to call every couple of seconds. */
+bool ShsVolumeMounted(const char *root);
+/* Roots of the drives that are connected right now: "E:\" on Windows (removable and fixed drives), the mount points under
+   /media, /run/media and /mnt on Linux, /Volumes/NAME on macOS. Returns how many were written (at most `max`). */
+#define SHS_VOLUME_PATH 260
+int  ShsListVolumes(char (*roots)[SHS_VOLUME_PATH], int max);
+
+/* ID marker: a small hidden file ".simplesync-id" in a target folder naming the sync tasks it belongs to ("id=<hex>" lines).
+   A USB sync task finds its stick again by looking for its id in the same folder on every connected drive, whatever
+   drive letter or mount point the stick got this time. */
+bool ShsMarkerHas(const char *folder, const char *id);
+bool ShsMarkerRemove(const char *folder, const char *id);   /* takes the id out again (a task was deleted); the file goes when no id is left */
+bool ShsMarkerAdd(const char *folder, const char *id);      /* creates the file if needed and adds the id; true if it is there afterwards */
+
 
 /* ---- start with the system ---- */
 bool ShsAutostartEnabled(void);

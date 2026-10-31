@@ -7,11 +7,14 @@
 #endif
 #include "sync_engine.h"
 #include "task_store.h"
+#include "updater.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -226,6 +229,7 @@ int main(int argc, char **argv)
         snprintf(in[0].source, sizeof in[0].source, "C:/a b/src");
         snprintf(in[0].target, sizeof in[0].target, "D:/dst");
         in[0].mirror = true; in[0].lastSync = 1700000000LL; in[0].lastBytes = 12345; in[0].autoSync = true;
+        in[0].usbSync = true; in[0].includeFolder = true; snprintf(in[0].usbId, sizeof in[0].usbId, "0123456789abcdef"); in[0].usbMark = true; snprintf(in[0].deletedDir, sizeof in[0].deletedDir, "D:/dst/Deleted files");
         snprintf(in[1].name, sizeof in[1].name, "Second");
         snprintf(in[1].source, sizeof in[1].source, "/x");
         snprintf(in[1].target, sizeof in[1].target, "/y");
@@ -238,6 +242,16 @@ int main(int argc, char **argv)
             CHECK(out[0].mirror && out[0].lastSync == 1700000000LL && out[0].lastBytes == 12345);
             CHECK(!out[1].mirror && out[1].lastSync == 0 && !out[1].autoSync);
             CHECK(out[0].autoSync);
+            CHECK(out[0].usbSync && strcmp(out[0].deletedDir, "D:/dst/Deleted files") == 0);
+            CHECK(!out[1].usbSync && out[1].deletedDir[0] == 0);
+            CHECK(out[0].includeFolder && !out[1].includeFolder);
+            CHECK(strcmp(out[0].usbId, "0123456789abcdef") == 0 && out[1].usbId[0] == 0 && out[0].usbMark && !out[1].usbMark);   /* the mark option is saved per task */
+        }
+        {                                                         /* a task file from an older version (7 columns) still loads */
+            FILE *old = fopen(path, "wb");
+            if (old) { fputs("Old\t/s\t/t\t1\t5\t6\t1\n", old); fclose(old); }
+            int on = ShsStoreLoad(path, out, 4);
+            CHECK(on == 1 && out[0].mirror && out[0].autoSync && !out[0].usbSync && out[0].deletedDir[0] == 0);
         }
         CHECK(ShsStoreLoad("does/not/exist.tsv", out, 4) == 0);
         remove(path);
@@ -452,6 +466,348 @@ int main(int argc, char **argv)
         RemoveTree(csrc); RemoveTree(cdst);
     }
 
+    /* ---- many small files in a deep tree: parallel scan finds everything, direct writes leave no temp files ---- */
+    {
+        printf("many small files (parallel scan, direct writes)\n");
+        char msrc[700], mdst[700], p[900];
+        snprintf(msrc, sizeof msrc, "%s/many_src", g_base);
+        snprintf(mdst, sizeof mdst, "%s/many_dst", g_base);
+        RemoveTree(msrc); RemoveTree(mdst);
+        MKDIR(msrc);
+        int made = 0;
+        for (int a = 0; a < 6; a++) {
+            snprintf(p, sizeof p, "%s/d%d", msrc, a); MKDIR(p);
+            for (int b = 0; b < 6; b++) {
+                snprintf(p, sizeof p, "%s/d%d/e%d", msrc, a, b); MKDIR(p);
+                for (int c = 0; c < 2; c++) {
+                    snprintf(p, sizeof p, "%s/d%d/e%d/f%d", msrc, a, b, c); MKDIR(p);
+                    for (int k = 0; k < 8; k++) {
+                        snprintf(p, sizeof p, "%s/d%d/e%d/f%d/s%d.bin", msrc, a, b, c, k);
+                        MakeFilled(p, 100 + (size_t)(a * 31 + b * 7 + c * 3 + k) * 13, (unsigned)(made + 100));
+                        made++;
+                    }
+                }
+            }
+        }
+        ShsSyncConfigure(4, 64);
+        clock_t t0 = clock();
+        ShsSyncStatus ms = RunSyncPaths(msrc, mdst, false);
+        printf("  %d files copied in %ld ms\n", made, (long)((clock() - t0) * 1000 / CLOCKS_PER_SEC));
+        CHECK(ms.state == SHS_SYNC_DONE && ms.errorCount == 0);
+        CHECK(ms.filesDone == (uint64_t)made && ms.filesTotal == (uint64_t)made);
+        CHECK(SizeOf(mdst, "d0/e0/f0/s0.bin") == 100);
+        CHECK(SizeOf(mdst, "d5/e5/f1/s7.bin") == 100 + (5 * 31 + 5 * 7 + 1 * 3 + 7) * 13);
+        CHECK(SizeOf(mdst, "d3/e2/f1/s4.bin.shs-tmp") < 0);                        /* no temp files left behind */
+        ShsSyncStatus again = RunSyncPaths(msrc, mdst, false);                   /* second run: nothing to copy */
+        CHECK(again.state == SHS_SYNC_DONE && again.filesTotal == 0);
+        snprintf(p, sizeof p, "%s/d2/e3/f0/s1.bin", msrc); MakeFilled(p, 5000, 7);   /* a changed file goes through the temp file + rename */
+        ShsSyncStatus chg = RunSyncPaths(msrc, mdst, false);
+        CHECK(chg.state == SHS_SYNC_DONE && chg.filesDone == 1);
+        CHECK(SizeOf(mdst, "d2/e3/f0/s1.bin") == 5000);
+        snprintf(p, sizeof p, "%s/d1/e1/f1/s1.bin", msrc); remove(p);               /* mirror deletes what is gone from the source */
+        ShsSyncStatus mir = RunSyncPaths(msrc, mdst, true);
+        CHECK(mir.state == SHS_SYNC_DONE && mir.filesDeleted == 1);
+        CHECK(SizeOf(mdst, "d1/e1/f1/s1.bin") < 0);
+        RemoveTree(msrc); RemoveTree(mdst);
+    }
+
+    /* ---- mirror with a deleted-files folder: removed files are moved there, not deleted ---- */
+    {
+        printf("mirror keeps removed files in the deleted-files folder\n");
+        char ksrc[700], kdst[700], kdel[700], p[900];
+        snprintf(ksrc, sizeof ksrc, "%s/keep_src", g_base);
+        snprintf(kdst, sizeof kdst, "%s/keep_dst", g_base);
+        snprintf(kdel, sizeof kdel, "%s/keep_dst/Deleted files", g_base);          /* inside the target */
+        RemoveTree(ksrc); RemoveTree(kdst);
+        MKDIR(g_base); MKDIR(ksrc); MKDIR(kdst);
+        snprintf(p, sizeof p, "%s/sub", ksrc); MKDIR(p);
+        snprintf(p, sizeof p, "%s/a.txt", ksrc);     MakeFilled(p, 3000, 61);
+        snprintf(p, sizeof p, "%s/sub/b.txt", ksrc); MakeFilled(p, 2000, 62);
+        snprintf(p, sizeof p, "%s/sub/c.txt", ksrc); MakeFilled(p, 1000, 63);
+
+        ShsSyncJob *j = ShsSyncStartEx(ksrc, kdst, true, kdel, false);
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        ShsSyncStatus s; memset(&s, 0, sizeof s);
+        if (j) { ShsSyncGetStatus(j, &s); ShsSyncFree(j); }
+        CHECK(s.state == SHS_SYNC_DONE && SizeOf(kdst, "sub/b.txt") == 2000);
+
+        snprintf(p, sizeof p, "%s/sub/b.txt", ksrc); remove(p);                    /* delete one file from the source... */
+        snprintf(p, sizeof p, "%s/a.txt", ksrc);     remove(p);
+        for (int round = 0; round < 2; round++) {                                  /* ...second round: the kept copy must survive another mirror run */
+            j = ShsSyncStartEx(ksrc, kdst, true, kdel, false);
+            for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+            memset(&s, 0, sizeof s);
+            if (j) { ShsSyncGetStatus(j, &s); ShsSyncFree(j); }
+            CHECK(s.state == SHS_SYNC_DONE && s.errorCount == 0);
+            CHECK(round == 0 ? s.filesDeleted >= 2 : s.filesDeleted == 0);
+            CHECK(SizeOf(kdst, "a.txt") < 0 && SizeOf(kdst, "sub/b.txt") < 0);      /* gone from the target */
+            CHECK(SizeOf(kdst, "sub/c.txt") == 1000);
+            CHECK(SizeOf(kdel, "a.txt") == 3000);                                   /* ...but kept, with its relative path */
+            CHECK(SizeOf(kdel, "sub/b.txt") == 2000);
+        }
+
+        snprintf(p, sizeof p, "%s/a.txt", ksrc); MakeFilled(p, 3000, 64);          /* same name comes and goes again: the old kept copy is not overwritten */
+        ShsSyncStatus back = RunSyncPaths(ksrc, kdst, false);
+        CHECK(back.state == SHS_SYNC_DONE && SizeOf(kdst, "a.txt") == 3000);
+        remove(p);
+        j = ShsSyncStartEx(ksrc, kdst, true, kdel, false);
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        if (j) ShsSyncFree(j);
+        CHECK(SizeOf(kdel, "a.txt") == 3000 && SizeOf(kdst, "a.txt") < 0);
+
+        RemoveTree(ksrc); RemoveTree(kdst);
+    }
+
+    /* ---- include the folder itself: <target>/<folder name>/..., mirrored only inside that folder ---- */
+    {
+        printf("sync task can include the source folder itself\n");
+        char isrc[700], idst[700], p[900];
+        snprintf(isrc, sizeof isrc, "%s/Photos", g_base);
+        snprintf(idst, sizeof idst, "%s/incl_dst", g_base);
+        RemoveTree(isrc); RemoveTree(idst);
+        MKDIR(g_base); MKDIR(isrc); MKDIR(idst);
+        snprintf(p, sizeof p, "%s/sub", isrc); MKDIR(p);
+        snprintf(p, sizeof p, "%s/a.txt", isrc);     MakeFilled(p, 1500, 71);
+        snprintf(p, sizeof p, "%s/sub/b.txt", isrc); MakeFilled(p, 2500, 72);
+        snprintf(p, sizeof p, "%s/other.txt", idst); MakeFilled(p, 700, 73);       /* outside the copied folder: mirror must leave it */
+
+        ShsSyncJob *j = ShsSyncStartEx(isrc, idst, true, NULL, true);
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        ShsSyncStatus s; memset(&s, 0, sizeof s);
+        if (j) { ShsSyncGetStatus(j, &s); ShsSyncFree(j); }
+        CHECK(s.state == SHS_SYNC_DONE && s.errorCount == 0 && s.filesDone == 2);
+        CHECK(SizeOf(idst, "Photos/a.txt") == 1500 && SizeOf(idst, "Photos/sub/b.txt") == 2500);
+        CHECK(SizeOf(idst, "a.txt") < 0);                                           /* not copied loose into the target */
+        CHECK(SizeOf(idst, "other.txt") == 700);
+
+        snprintf(p, sizeof p, "%s/a.txt", isrc); remove(p);                         /* mirror removes it from <target>/Photos only */
+        j = ShsSyncStartEx(isrc, idst, true, NULL, true);
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        memset(&s, 0, sizeof s);
+        if (j) { ShsSyncGetStatus(j, &s); ShsSyncFree(j); }
+        CHECK(s.state == SHS_SYNC_DONE && s.filesDeleted == 1);
+        CHECK(SizeOf(idst, "Photos/a.txt") < 0 && SizeOf(idst, "Photos/sub/b.txt") == 2500 && SizeOf(idst, "other.txt") == 700);
+        RemoveTree(isrc); RemoveTree(idst);
+    }
+
+    /* ---- excluded folders: not copied, and left alone in the target by mirror ---- */
+    {
+        printf("excluded folders are not copied and survive mirror\n");
+        char esrc[700], edst[700], p[900];
+        snprintf(esrc, sizeof esrc, "%s/excl_src", g_base);
+        snprintf(edst, sizeof edst, "%s/excl_dst", g_base);
+        RemoveTree(esrc); RemoveTree(edst);
+        MKDIR(g_base); MKDIR(esrc); MKDIR(edst);
+        snprintf(p, sizeof p, "%s/keep", esrc);             MKDIR(p);
+        snprintf(p, sizeof p, "%s/node_modules", esrc);     MKDIR(p);
+        snprintf(p, sizeof p, "%s/keep/Node_Modules", esrc); MKDIR(p);                   /* a bare name matches at any depth, ignoring case */
+        snprintf(p, sizeof p, "%s/build", esrc);            MKDIR(p);
+        snprintf(p, sizeof p, "%s/build/cache", esrc);      MKDIR(p);
+        snprintf(p, sizeof p, "%s/build/out", esrc);        MKDIR(p);
+        snprintf(p, sizeof p, "%s/keep/a.txt", esrc);                MakeFilled(p, 1000, 81);
+        snprintf(p, sizeof p, "%s/node_modules/x.js", esrc);         MakeFilled(p, 1100, 82);
+        snprintf(p, sizeof p, "%s/keep/Node_Modules/y.js", esrc);    MakeFilled(p, 1200, 83);
+        snprintf(p, sizeof p, "%s/build/cache/c.bin", esrc);         MakeFilled(p, 1300, 84);
+        snprintf(p, sizeof p, "%s/build/out/o.bin", esrc);           MakeFilled(p, 1400, 85);
+        snprintf(p, sizeof p, "%s/node_modules", edst);              MKDIR(p);
+        snprintf(p, sizeof p, "%s/node_modules/old.js", edst);       MakeFilled(p, 900, 86);   /* already in the target: mirror must keep it */
+        snprintf(p, sizeof p, "%s/stale.txt", edst);                 MakeFilled(p, 800, 87);   /* not excluded: mirror removes it */
+
+        ShsSyncJob *j = ShsSyncStartExcl(esrc, edst, true, NULL, false, "node_modules|build\\cache");
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        ShsSyncStatus s; memset(&s, 0, sizeof s);
+        if (j) { ShsSyncGetStatus(j, &s); ShsSyncFree(j); }
+        CHECK(s.state == SHS_SYNC_DONE && s.errorCount == 0 && s.filesDone == 2);
+        CHECK(SizeOf(edst, "keep/a.txt") == 1000 && SizeOf(edst, "build/out/o.bin") == 1400);
+        CHECK(SizeOf(edst, "node_modules/x.js") < 0 && SizeOf(edst, "keep/Node_Modules/y.js") < 0 && SizeOf(edst, "build/cache/c.bin") < 0);
+        CHECK(SizeOf(edst, "node_modules/old.js") == 900);
+        CHECK(SizeOf(edst, "stale.txt") < 0);
+
+        ShsTaskDef def; memset(&def, 0, sizeof def);                                    /* the list is saved with the task */
+        snprintf(def.name, sizeof def.name, "t"); snprintf(def.source, sizeof def.source, "a"); snprintf(def.target, sizeof def.target, "b");
+        snprintf(def.exclude, sizeof def.exclude, "node_modules|build/cache");
+        char sf[800]; snprintf(sf, sizeof sf, "%s/excl_tasks.txt", g_base);
+        ShsTaskDef back[2];
+        CHECK(ShsStoreSave(sf, &def, 1) && ShsStoreLoad(sf, back, 2) == 1 && !strcmp(back[0].exclude, def.exclude));
+        remove(sf);
+        RemoveTree(esrc); RemoveTree(edst);
+    }
+
+    /* ---- purge: delete what a task copied into its target, nothing else ---- */
+    {
+        printf("purge deletes only what the task copied\n");
+        char psrc[700], pdst[700], p[900];
+        snprintf(psrc, sizeof psrc, "%s/Docs", g_base);
+        snprintf(pdst, sizeof pdst, "%s/purge_dst", g_base);
+        RemoveTree(psrc); RemoveTree(pdst);
+        MKDIR(g_base); MKDIR(psrc); MKDIR(pdst);
+        snprintf(p, sizeof p, "%s/sub", psrc); MKDIR(p);
+        snprintf(p, sizeof p, "%s/a.txt", psrc);     MakeFilled(p, 1000, 91);
+        snprintf(p, sizeof p, "%s/sub/b.txt", psrc); MakeFilled(p, 2000, 92);
+
+        /* without "include the folder": files that also exist in the source go, the rest of the target stays */
+        ShsSyncStatus s1 = RunSyncPaths(psrc, pdst, false);
+        CHECK(s1.state == SHS_SYNC_DONE && SizeOf(pdst, "sub/b.txt") == 2000);
+        snprintf(p, sizeof p, "%s/keep.txt", pdst); MakeFilled(p, 300, 93);                         /* someone else's file */
+        snprintf(p, sizeof p, "%s/sub/mine_now.txt", pdst); MakeFilled(p, 400, 94);                 /* in a synced folder, but not from the source */
+        ShsPurgeJob *pj = ShsPurgeStart(psrc, pdst, false);
+        uint64_t del = 0, fail = 0;
+        for (int i = 0; pj && i < 3000 && !ShsPurgeStatus(pj, &del, &fail); i++) SLEEP_MS(10);
+        CHECK(pj && ShsPurgeStatus(pj, &del, &fail) && del == 2 && fail == 0);
+        ShsPurgeFree(pj);
+        CHECK(SizeOf(pdst, "a.txt") < 0 && SizeOf(pdst, "sub/b.txt") < 0);
+        CHECK(SizeOf(pdst, "keep.txt") == 300 && SizeOf(pdst, "sub/mine_now.txt") == 400);          /* untouched, and so is the folder that still holds one */
+
+        /* with "include the folder": its own folder goes completely, the target around it stays */
+        snprintf(p, sizeof p, "%s/purge_dst2", g_base);
+        RemoveTree(p); MKDIR(p);
+        ShsSyncJob *sj = ShsSyncStartEx(psrc, p, false, NULL, true);
+        for (int i = 0; sj && i < 3000 && !ShsSyncIsFinished(sj); i++) SLEEP_MS(10);
+        if (sj) ShsSyncFree(sj);
+        CHECK(SizeOf(p, "Docs/sub/b.txt") == 2000);
+        char q[900]; snprintf(q, sizeof q, "%s/other.txt", p); MakeFilled(q, 123, 95);
+        snprintf(q, sizeof q, "%s/Docs/extra_leftover.txt", p); MakeFilled(q, 77, 96);              /* not in the source, but inside the task's folder */
+        pj = ShsPurgeStart(psrc, p, true);
+        for (int i = 0; pj && i < 3000 && !ShsPurgeStatus(pj, &del, &fail); i++) SLEEP_MS(10);
+        CHECK(pj && ShsPurgeStatus(pj, &del, &fail) && del == 3 && fail == 0);
+        ShsPurgeFree(pj);
+        CHECK(SizeOf(p, "Docs/a.txt") < 0 && SizeOf(p, "Docs/extra_leftover.txt") < 0);
+        CHECK(SizeOf(p, "other.txt") == 123);
+        snprintf(q, sizeof q, "%s/Docs", p);
+        { struct stat st; CHECK(stat(q, &st) != 0); }                                               /* the folder itself is gone */
+        RemoveTree(psrc); RemoveTree(pdst); RemoveTree(p);
+    }
+
+    /* ---- Office / LibreOffice lock files are left out; removed files show up in the file list ---- */
+    {
+        printf("lock files are skipped, removed files are listed\n");
+        char lsrc[700], ldst[700], p[900];
+        snprintf(lsrc, sizeof lsrc, "%s/lock_s", g_base);
+        snprintf(ldst, sizeof ldst, "%s/lock_d", g_base);
+        RemoveTree(lsrc); RemoveTree(ldst);
+        MKDIR(g_base); MKDIR(lsrc); MKDIR(ldst);
+        const char *names[] = { "real.txt", "~keep.txt", "~$Report.xlsx", "~WRL0001.tmp", ".~lock.Notes.odt#", "~scratch.TMP" };
+        for (int i = 0; i < 6; i++) { snprintf(p, sizeof p, "%s/%s", lsrc, names[i]); MakeFilled(p, 500 + (size_t)i, 80u + (unsigned)i); }
+        snprintf(p, sizeof p, "%s/gone.txt", ldst); MakeFilled(p, 300, 90);
+
+        ShsSyncJob *j = ShsSyncStart(lsrc, ldst, true);
+        for (int i = 0; j && i < 3000 && !ShsSyncIsFinished(j); i++) SLEEP_MS(10);
+        ShsSyncStatus s; memset(&s, 0, sizeof s);
+        if (j) ShsSyncGetStatus(j, &s);
+        CHECK(s.state == SHS_SYNC_DONE && s.errorCount == 0 && s.filesDone == 2);
+        CHECK(s.filesIgnored == 4);                                          /* the four lock files are counted... */
+        CHECK(SizeOf(ldst, "real.txt") == 500 && SizeOf(ldst, "~keep.txt") == 501);
+        CHECK(SizeOf(ldst, "~$Report.xlsx") < 0 && SizeOf(ldst, "~WRL0001.tmp") < 0);
+        CHECK(SizeOf(ldst, ".~lock.Notes.odt#") < 0 && SizeOf(ldst, "~scratch.TMP") < 0);
+        CHECK(SizeOf(ldst, "gone.txt") < 0 && s.filesDeleted == 1);
+        int removed = 0, doneN = 0, ignoredN = 0;
+        if (j) {
+            ShsSyncFileRow rows[8];
+            ShsSyncGetFiles(j, 1u << SHS_FILE_REMOVED, 0, 8, rows, &removed);
+            ShsSyncGetFiles(j, 1u << SHS_FILE_DONE, 0, 8, rows, &doneN);
+            ShsSyncGetFiles(j, 1u << SHS_FILE_IGNORED, 0, 8, rows, &ignoredN);            /* ...and listed, so the UI can show them */
+            if (ignoredN == 4) { int hasReport = 0; for (int k = 0; k < 4; k++) if (strstr(rows[k].name, "~$Report.xlsx")) hasReport = 1; CHECK(hasReport); }
+            ShsSyncFree(j);
+        }
+        CHECK(removed == 1 && doneN == 2 && ignoredN == 4);
+        RemoveTree(lsrc); RemoveTree(ldst);
+    }
+
+#ifdef _WIN32
+    /* ---- paths beyond Windows' 260-character limit (deep folders + the target's own folder name) must copy ---- */
+    {
+        printf("paths longer than 260 characters\n");
+        char base[MAX_PATH], lsrc[MAX_PATH], ldst[MAX_PATH], deep[1100], leaf[1200];
+        if (_fullpath(base, g_base, sizeof base)) {
+            snprintf(lsrc, sizeof lsrc, "%s\\long_src", base);
+            snprintf(ldst, sizeof ldst, "%s\\long_dst", base);
+            snprintf(deep, sizeof deep, "%s", lsrc);
+            for (int i = 0; i < 9; i++) strcat(deep, "\\dir_with_a_fairly_long_name_");       /* 9 x 29 chars: the path ends up near 350 */
+            snprintf(leaf, sizeof leaf, "%s\\file_in_the_deep_folder.bin", deep);
+            CHECK(strlen(leaf) > 300);
+
+            char prefixed[1300];
+            snprintf(prefixed, sizeof prefixed, "\\\\?\\%s", lsrc);
+            RemoveTree(prefixed);
+            snprintf(prefixed, sizeof prefixed, "\\\\?\\%s", ldst);
+            RemoveTree(prefixed);
+
+            wchar_t wl[1300];
+            wcscpy(wl, L"\\\\?\\");
+            MultiByteToWideChar(CP_UTF8, 0, deep, -1, wl + 4, 1290);
+            for (wchar_t *c = wl + 7; ; c++) {                                              /* every level, starting after "\\?\X:\" */
+                if (*c == L'\\' || *c == 0) {
+                    wchar_t keep = *c; *c = 0;
+                    CreateDirectoryW(wl, NULL);
+                    *c = keep;
+                    if (!keep) break;
+                }
+            }
+            wchar_t wf[1400];
+            wcscpy(wf, L"\\\\?\\");
+            MultiByteToWideChar(CP_UTF8, 0, leaf, -1, wf + 4, 1290);
+            FILE *f = _wfopen(wf, L"wb");
+            CHECK(f != NULL);
+            if (f) { for (int i = 0; i < 5000; i++) fputc(i & 0xFF, f); fclose(f); }
+
+            ShsSyncStatus ls = RunSyncPaths(lsrc, ldst, false);
+            CHECK(ls.state == SHS_SYNC_DONE && ls.errorCount == 0 && ls.filesDone == 1);
+
+            char dleaf[1300];
+            snprintf(dleaf, sizeof dleaf, "\\\\?\\%s%s", ldst, leaf + strlen(lsrc));
+            wchar_t wd[1400];
+            MultiByteToWideChar(CP_UTF8, 0, dleaf, -1, wd, 1400);
+            WIN32_FILE_ATTRIBUTE_DATA info;
+            CHECK(GetFileAttributesExW(wd, GetFileExInfoStandard, &info) && info.nFileSizeLow == 5000);   /* arrived intact */
+
+            ShsPurgeJob *lp = ShsPurgeStart(lsrc, ldst, false);                              /* ...and it can be deleted again (Explorer cannot) */
+            uint64_t ld = 0, lf = 0;
+            for (int i = 0; lp && i < 3000 && !ShsPurgeStatus(lp, &ld, &lf); i++) SLEEP_MS(10);
+            CHECK(lp && ShsPurgeStatus(lp, &ld, &lf) && ld == 1 && lf == 0);
+            ShsPurgeFree(lp);
+            CHECK(!GetFileAttributesExW(wd, GetFileExInfoStandard, &info));
+
+            snprintf(prefixed, sizeof prefixed, "\\\\?\\%s", lsrc);
+            RemoveTree(prefixed);
+            snprintf(prefixed, sizeof prefixed, "\\\\?\\%s", ldst);
+            RemoveTree(prefixed);
+        }
+    }
+#endif
+
+    /* ---- USB marker file: a hidden .simplesync-id in the target names the task, so the stick is found on any drive letter ---- */
+    {
+        printf("marker file identifies the target folder\n");
+        char mdir[700], p[900];
+        snprintf(mdir, sizeof mdir, "%s/marker_dir", g_base);
+        RemoveTree(mdir);
+        MKDIR(g_base); MKDIR(mdir);
+        CHECK(!ShsMarkerHas(mdir, "00112233445566aa"));                      /* nothing there yet */
+        CHECK(ShsMarkerAdd(mdir, "00112233445566aa") && ShsMarkerHas(mdir, "00112233445566aa"));
+        CHECK(!ShsMarkerHas(mdir, "00112233445566ab"));                      /* a different task's id does not match */
+        CHECK(ShsMarkerAdd(mdir, "00112233445566aa") && ShsMarkerAdd(mdir, "ffeeddccbbaa9988"));     /* adding again is harmless; a second task shares the folder */
+        CHECK(ShsMarkerHas(mdir, "00112233445566aa") && ShsMarkerHas(mdir, "ffeeddccbbaa9988"));
+        CHECK(!ShsMarkerHas(mdir, "00112233445566a") && !ShsMarkerHas(mdir, ""));      /* no partial or empty matches */
+        snprintf(p, sizeof p, "%s/.simplesync-id", mdir);
+        CHECK(SizeOf(mdir, ".simplesync-id") > 0);
+#ifdef _WIN32
+        {
+            wchar_t w[900]; MultiByteToWideChar(CP_UTF8, 0, p, -1, w, 900);
+            CHECK((GetFileAttributesW(w) & FILE_ATTRIBUTE_HIDDEN) != 0);       /* hidden in Explorer */
+            SetFileAttributesW(w, FILE_ATTRIBUTE_NORMAL);
+        }
+#endif
+        remove(p);
+        RemoveTree(mdir);
+        char vols[8][SHS_VOLUME_PATH];
+        int nv = ShsListVolumes(vols, 8);
+#ifdef _WIN32
+        CHECK(nv >= 1 && vols[0][1] == ':');                                  /* at least the system drive */
+#else
+        CHECK(nv >= 0);
+#endif
+    }
+
     /* ---- an unreadable folder in the target (like "System Volume Information" on a USB stick) must not fail the copy ---- */
 #ifdef _WIN32
     {
@@ -478,6 +834,32 @@ int main(int argc, char **argv)
         RemoveTree(usrc); RemoveTree(udst);
     }
 #endif
+
+    /* ---- update check helpers and drive detection (no network) ---- */
+    {
+        printf("version compare and volume roots\n");
+        CHECK(ShsVersionNewer("v0.0.4", "0.0.3"));
+        CHECK(ShsVersionNewer("0.1.0", "0.0.9"));
+        CHECK(ShsVersionNewer("v1.0.0", "0.9.9"));
+        CHECK(!ShsVersionNewer("v0.0.3", "0.0.3"));
+        CHECK(!ShsVersionNewer("v0.0.2", "0.0.3"));
+        CHECK(ShsVersionNewer("v0.0.3", "0.0.3-dev-2"));        /* the final release is newer than its own dev builds */
+        CHECK(!ShsVersionNewer("v0.0.3-dev-1", "0.0.3"));
+        CHECK(ShsVersionNewer("v0.0.4-dev-3", "0.0.4-dev-2") && !ShsVersionNewer("v0.0.4-dev-2", "0.0.4-dev-10"));
+        CHECK(ShsVersionNewer("v0.0.4-dev-1", "0.0.3") && !ShsVersionNewer("v0.0.4-dev-1", "0.0.4"));
+        CHECK(!ShsVersionCoreNewer("v0.0.1", "0.0.1-dev-90") && ShsVersionCoreNewer("v0.0.2", "0.0.1-dev-90"));   /* stable-only: a dev build of 0.0.1 is not outdated by 0.0.1 */
+        char root[300];
+#ifdef _WIN32
+        CHECK(ShsVolumeRoot("E:\\Backups\\x", root, sizeof root) && strcmp(root, "E:\\") == 0);
+        CHECK(ShsVolumeRoot("e:/Backups", root, sizeof root) && strcmp(root, "e:\\") == 0);
+        CHECK(ShsVolumeRoot("\\\\nas\\share\\dir\\x", root, sizeof root) && strcmp(root, "\\\\nas\\share") == 0);
+        CHECK(!ShsVolumeMounted("") && ShsVolumeMounted("C:\\"));
+#else
+        CHECK(ShsVolumeRoot("/Volumes/STICK/Backups", root, sizeof root) && strcmp(root, "/Volumes/STICK") == 0);
+        CHECK(ShsVolumeRoot("/media/me/STICK/x/y", root, sizeof root) && strcmp(root, "/media/me/STICK") == 0);
+        CHECK(!ShsVolumeRoot("/home/me/x", root, sizeof root));
+#endif
+    }
 
     CleanAll();
     printf(g_fail ? "FAILED (%d)\n" : "ALL PASSED\n", g_fail);
