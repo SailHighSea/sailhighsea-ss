@@ -123,7 +123,10 @@ static bool      g_updateFound = false;      /* a newer release exists: shown in
 static char      g_updateTag[64], g_updateUrl[256];
 static char      g_updateMsg[96];            /* result of the last check, shown in Settings */
 static float     g_setScroll = 0, g_setMax = 0;   /* Settings page scroll offset and the most it can scroll */
-static bool      g_hidden = false;           /* window currently hidden in the tray */
+static float     g_aboutScroll = 0, g_aboutMax = 0;   /* About page scroll offset and the most it can scroll */
+static char      g_toast[200];               /* pop-up notice (USB drive connected) */
+static double    g_toastUntil = 0;
+static bool      g_hidden = false;          /* window currently hidden in the tray */
 static bool      g_launchedHidden = false;   /* started with --minimized */
 static bool      g_multi = false;            /* started with --multi (testing): must not touch the start-up entry */
 static bool      g_restart = false;          /* theme switch: start a fresh copy after closing */
@@ -769,6 +772,9 @@ static void UsbTasks(void)
             if (a->usbInit && present && !a->usbSeen) {
                 a->usbSyncAt = now + USB_SETTLE_S;
                 LogAdd("%s: USB drive %s connected", a->def.name, tgt);
+                snprintf(g_toast, sizeof g_toast, "USB drive connected (%s) - task \"%s\"", tgt, a->def.name);
+                g_toastUntil = now + 8.0;
+                ShsTrayNotify("USB drive connected", g_toast);
             }
             if (!present) a->usbSyncAt = 0;                        /* unplugged again before the sync started */
             a->usbSeen = present;
@@ -1986,7 +1992,7 @@ int main(int argc, char **argv)
             /* Nothing is moving and nobody is interacting: do not render at all (only once a minute so the "ago"
                texts stay fresh). Events are still polled, so the first mouse move or key wakes the window up. */
             static double lastDraw = 0;
-            if (nowT - lastInput >= 1.0 && !anyJob && nowT - lastDraw < 60.0) skipDraw = true;
+            if (nowT - lastInput >= 1.0 && !anyJob && nowT - lastDraw < 60.0 && nowT >= g_toastUntil) skipDraw = true;
             else lastDraw = nowT;
 
             /* Idle for a while: give unused memory back to the OS once (it comes back on demand when the app is used). */
@@ -2465,6 +2471,16 @@ int main(int argc, char **argv)
                 g_block = prevBlock;
                 g_setMax = fmaxf(0.0f, (y + 46 + 24 + g_setScroll) - contentTop - (viewBot - contentTop));
             } else if (nav == NAV_ABOUT) {
+                const float viewTop = y - 8, viewBot = (float)(H - STATUSBAR_H);       /* the page scrolls inside this band */
+                if (!g_block && !dlg.open) g_aboutScroll -= GetMouseWheelMove() * 48.0f;
+                if (g_aboutScroll > g_aboutMax) g_aboutScroll = g_aboutMax;
+                if (g_aboutScroll < 0) g_aboutScroll = 0;
+                BeginScissorMode(0, (int)viewTop, W, (int)(viewBot - viewTop));
+                const bool prevBlock = g_block;                                        /* scrolled-off buttons must not take clicks */
+                const Vector2 mp = GetMousePosition();
+                if (mp.y < viewTop || mp.y > viewBot) g_block = true;
+                const float contentTop = y;
+                y -= g_aboutScroll;
                 /* header: icon, name, version, tagline */
                 const float icon = 96.0f, tx = px + icon + 24.0f;
                 if (g_logo.id)
@@ -2524,7 +2540,21 @@ int main(int argc, char **argv)
                     LogAdd("Copied version info to the clipboard");
                 }
                 ShsDrawText("Settings, tasks and the test folders are kept next to the program.", (int)px, (int)by + 52, 14, SHS_COLOR_TEXT_MUTED);
+                EndScissorMode();
+                g_block = prevBlock;
+                g_aboutMax = fmaxf(0.0f, (by + 52 + 14 + 24 + g_aboutScroll) - contentTop - (viewBot - contentTop));
             }
+        }
+
+        /* USB toast: a stick that belongs to a task was just plugged in */
+        if (g_toast[0] && GetTime() < g_toastUntil) {
+            const int tw = ShsMeasureText(g_toast, 15);
+            const float age = (float)(g_toastUntil - GetTime());
+            const float a = age < 0.4f ? age / 0.4f : 1.0f;
+            Rectangle tr = { (float)W - tw - 60 - 16, (float)(H - STATUSBAR_H) - 52 - 12, (float)tw + 60, 52 };
+            ShsDrawRoundedBox(tr, 10.0f, Fade(SHS_COLOR_CARD, a), Fade(SHS_COLOR_PRIMARY, a));
+            DrawCircle((int)tr.x + 22, (int)(tr.y + tr.height / 2), 5.0f, Fade(SHS_COLOR_SUCCESS, a));
+            ShsDrawText(g_toast, (int)tr.x + 40, (int)tr.y + 17, 15, Fade(SHS_COLOR_TEXT_MAIN, a));
         }
 
         if (railTip && !g_block) {                       /* icon rail tooltip, drawn over the page */

@@ -93,6 +93,7 @@ double ShsFreeDiskGiB(const char *path)
 
 #define WM_SHS_TRAY (WM_APP + 1)
 #define WM_SHS_TIP  (WM_APP + 2)
+#define WM_SHS_NOTE (WM_APP + 3)
 #define ID_TRAY_OPEN 1001
 #define ID_TRAY_SYNC 1002
 #define ID_TRAY_QUIT 1003
@@ -139,6 +140,14 @@ static LRESULT CALLBACK TrayProc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_nid.uFlags = NIF_TIP;
         Shell_NotifyIconW(NIM_MODIFY, &g_nid);
         g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        return 0;
+    }
+    if (m == WM_SHS_NOTE) {                                      /* balloon / toast notification */
+        g_nid.uFlags = NIF_INFO;
+        g_nid.dwInfoFlags = NIIF_INFO;
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+        g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        g_nid.szInfo[0] = 0; g_nid.szInfoTitle[0] = 0;
         return 0;
     }
     if (m == g_taskbarCreated && m != 0) {                       /* Explorer restarted: put the icon back */
@@ -204,6 +213,14 @@ void ShsTraySetTooltip(const char *tooltip)
     if (!g_trayThread || !g_trayWnd || !tooltip) return;
     MultiByteToWideChar(CP_UTF8, 0, tooltip, -1, g_nid.szTip, 127);
     PostMessageW(g_trayWnd, WM_SHS_TIP, 0, 0);
+}
+
+void ShsTrayNotify(const char *title, const char *text)
+{
+    if (!g_trayThread || !g_trayWnd) return;
+    MultiByteToWideChar(CP_UTF8, 0, title, -1, g_nid.szInfoTitle, 63);
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, g_nid.szInfo, 255);
+    PostMessageW(g_trayWnd, WM_SHS_NOTE, 0, 0);
 }
 
 void ShsTrayDestroy(void)
@@ -470,6 +487,7 @@ bool ShsTraySupported(void)                  { return false; }
 bool ShsTrayCreate(const char *tooltip)      { (void)tooltip; return false; }
 bool ShsTrayActive(void)                     { return false; }
 void ShsTraySetTooltip(const char *tooltip)  { (void)tooltip; }
+void ShsTrayNotify(const char *title, const char *text) { (void)title; (void)text; }
 void ShsTrayDestroy(void)                    {}
 int  ShsTrayPoll(void)                       { return 0; }
 bool ShsSingleInstance(void)                 { return true; }

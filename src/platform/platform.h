@@ -33,6 +33,7 @@ bool ShsTraySupported(void);
 bool ShsTrayCreate(const char *tooltip);     /* adds the notification-area icon; false on failure */
 bool ShsTrayActive(void);
 void ShsTraySetTooltip(const char *tooltip);
+void ShsTrayNotify(const char *title, const char *text);   /* system pop-up (balloon / toast) from the tray icon */
 void ShsTrayDestroy(void);
 /* Windows: true for the first copy; a second copy gets false after asking the first to show its window
    (via the SHS_TRAY_SHOW event) and should exit. Other platforms always return true. */
