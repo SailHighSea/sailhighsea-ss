@@ -12,7 +12,8 @@ typedef enum {
     SHS_TASK_IDLE = 0,   /* green, "Up-to-date" */
     SHS_TASK_SYNCING,    /* blue, spinner + progress bar */
     SHS_TASK_ERROR,      /* red box with warning text */
-    SHS_TASK_PAUSED      /* amber badge */
+    SHS_TASK_PAUSED,     /* amber badge */
+    SHS_TASK_USB_OFF     /* grey badge "USB not connected", no error box */
 } ShsTaskState;
 
 #define SHS_TASK_FILES      8

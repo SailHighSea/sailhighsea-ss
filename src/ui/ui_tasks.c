@@ -166,7 +166,8 @@ static Color StateColor(ShsTaskState s)
         case SHS_TASK_SYNCING: return SHS_COLOR_PRIMARY;
         case SHS_TASK_ERROR:   return SHS_COLOR_DANGER;
         case SHS_TASK_PAUSED:  return SHS_COLOR_WARNING;
-        default:               return SHS_COLOR_SUCCESS;
+        case SHS_TASK_USB_OFF: return SHS_COLOR_TEXT_MUTED;
+        default:              return SHS_COLOR_SUCCESS;
     }
 }
 
@@ -179,6 +180,7 @@ static float DrawBadge(ShsTaskState state, float rightX, float y)      /* return
         case SHS_TASK_SYNCING: label = "Syncing";    break;
         case SHS_TASK_ERROR:   label = "Error";      break;
         case SHS_TASK_PAUSED:  label = "Paused";     break;
+        case SHS_TASK_USB_OFF: label = "USB not connected"; break;
         default:               label = "Up-to-date"; break;
     }
     Color col = StateColor(state);

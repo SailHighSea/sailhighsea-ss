@@ -69,6 +69,7 @@ typedef struct {
     char           runTarget[SHS_DEF_PATH_MAX];   /* the target the current / last run used (a USB task may have moved to another drive letter) */
     bool           failed;       /* last run ended with errors */
     char           resultMsg[SHS_TASK_MSG_MAX];
+    bool           usbMissing;                /* the last start failed only because the USB drive is unplugged */
 
     /* Quick Copy extras */
     ShsSyncJob    *doneJob;      /* the finished job, kept so its file list stays on the card */
@@ -579,9 +580,11 @@ static void StartTaskItem(int i, const char *item)
     if (a->job) return;
     char tgtBuf[SHS_DEF_PATH_MAX], delBuf[SHS_DEF_PATH_MAX];
     const char *tgt = a->def.target, *del = a->def.deletedDir;
+    a->usbMissing = false;
     if (!item && !a->quick && a->def.usbSync) {                       /* USB sync: the stick must be there, and be the right one */
         if (!UsbResolve(&a->def, tgtBuf, sizeof tgtBuf, delBuf, sizeof delBuf)) {
             a->failed = true;
+            a->usbMissing = true;
             snprintf(a->resultMsg, sizeof a->resultMsg, "The USB drive for this task is not connected.");
             LogAdd("%s: %s", a->def.name, a->resultMsg);
             return;
@@ -936,7 +939,9 @@ static void BuildView(const AppTask *a, ShsTask *v)
     }
     snprintf(v->meta, sizeof v->meta, "%s", meta);
 
-    if (a->failed) {
+    if (a->failed && a->usbMissing) {
+        v->state = SHS_TASK_USB_OFF;
+    } else if (a->failed) {
         v->state = SHS_TASK_ERROR;
         snprintf(v->errorMsg, sizeof v->errorMsg, "%s", a->resultMsg);
     } else {
@@ -2061,6 +2066,7 @@ int main(int argc, char **argv)
                 case SHS_TASK_IDLE:    nIdle++;   break;
                 case SHS_TASK_ERROR:   nErr++;    break;
                 case SHS_TASK_PAUSED:  nPaused++; break;
+                case SHS_TASK_USB_OFF: break;
             }
         }
 
